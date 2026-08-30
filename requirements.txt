@@ -1,0 +1,26 @@
+# GRIT local/Qwen3 smoke-run environment.
+#
+# Create the env with Python 3.10:
+#   conda create -n grit-qwen3 python=3.10 -y
+#   conda activate grit-qwen3
+#   pip install -r requirements.txt
+#
+# Do not install this file from Python 3.13+: torch==2.2.2 and numpy<2.0.0
+# do not have compatible wheels there.
+#
+# The full NSPO/verl training stack includes CUDA/Linux-oriented packages such
+# as flash-attn and vllm. This file is intentionally scoped to the dependencies
+# needed by the GRIT utilities, data preparation, projector building, and
+# Qwen2.5-0.5B smoke workflow in this repository.
+numpy<2.0.0
+torch==2.2.2
+transformers==4.53.3
+datasets==4.8.5
+accelerate==1.10.1
+pandas==2.3.3
+pyarrow>=19.0.0
+tqdm
+safetensors
+sentencepiece
+huggingface_hub>=0.30.0,<1.0
+packaging>=20.0
