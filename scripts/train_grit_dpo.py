@@ -9,6 +9,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -257,6 +258,18 @@ def maybe_push_to_hub(args: argparse.Namespace, checkpoint_dir: Path, step: int)
         path_in_repo=f"checkpoints/step_{step:06d}",
         commit_message=f"GRIT checkpoint step {step}",
     )
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(f"checkpoints/step_{step:06d}\n")
+        latest_pointer = Path(handle.name)
+    try:
+        api.upload_file(
+            repo_id=args.hub_repo_id,
+            path_or_fileobj=str(latest_pointer),
+            path_in_repo="checkpoints/latest_checkpoint.txt",
+            commit_message=f"Update latest GRIT checkpoint to step {step}",
+        )
+    finally:
+        latest_pointer.unlink(missing_ok=True)
 
 
 def load_checkpoint_if_needed(model, optimizer, checkpoint_path: str | None, device: torch.device) -> int:

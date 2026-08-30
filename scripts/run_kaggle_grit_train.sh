@@ -31,6 +31,9 @@ fi
 MAX_STEPS="${MAX_STEPS:-1000}"
 SAVE_STEPS="${SAVE_STEPS:-100}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
+HUB_REPO_ID="${HUB_REPO_ID:-}"
+HUB_PRIVATE="${HUB_PRIVATE:-0}"
 
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "TASK_FILE=${TASK_FILE}"
@@ -38,6 +41,21 @@ echo "PRESERVE_FILE=${PRESERVE_FILE}"
 echo "PROJECTORS_PATH=${PROJECTORS_PATH}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "MAX_STEPS=${MAX_STEPS} SAVE_STEPS=${SAVE_STEPS} NPROC_PER_NODE=${NPROC_PER_NODE}"
+if [[ "${PUSH_TO_HUB}" == "1" ]]; then
+  echo "PUSH_TO_HUB=1 HUB_REPO_ID=${HUB_REPO_ID}"
+fi
+
+extra_args=()
+if [[ "${PUSH_TO_HUB}" == "1" ]]; then
+  if [[ -z "${HUB_REPO_ID}" ]]; then
+    echo "HUB_REPO_ID is required when PUSH_TO_HUB=1" >&2
+    exit 2
+  fi
+  extra_args+=(--push-to-hub --hub-repo-id "${HUB_REPO_ID}")
+  if [[ "${HUB_PRIVATE}" == "1" ]]; then
+    extra_args+=(--hub-private)
+  fi
+fi
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" scripts/train_grit_dpo.py \
   --model-path "${MODEL_PATH}" \
@@ -60,4 +78,5 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" scripts/train_grit_dp
   --default-probability 1e-6 \
   --dtype float16 \
   --trust-remote-code \
+  "${extra_args[@]}" \
   "$@"

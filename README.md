@@ -223,10 +223,17 @@ scripts/run_kaggle_grit_train.sh \
 ```
 
 To push checkpoints to Hugging Face Hub, set `HF_TOKEN` in Kaggle Secrets and
-add:
+enable automatic uploads:
 
 ```bash
-scripts/run_kaggle_grit_train.sh \
-  --push-to-hub \
-  --hub-repo-id your-username/grit-qwen2-5-0-5b
+PUSH_TO_HUB=1 \
+HUB_REPO_ID=your-username/grit-qwen2-5-0-5b \
+MAX_STEPS=1000 \
+SAVE_STEPS=100 \
+NPROC_PER_NODE=2 \
+scripts/run_kaggle_grit_train.sh
 ```
+
+Every saved checkpoint is uploaded to
+`checkpoints/step_XXXXXX`, and `checkpoints/latest_checkpoint.txt` on the Hub is
+updated to point at the newest uploaded checkpoint.
