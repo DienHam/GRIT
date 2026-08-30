@@ -210,6 +210,19 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# GRIT generated artifacts and heavy local data
+data/
+artifacts/
+checkpoints/
+outputs/
+runs/
+wandb/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.parquet
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

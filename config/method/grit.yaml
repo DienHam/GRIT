@@ -1,0 +1,35 @@
+method: grit
+
+projectors:
+  path: artifacts/projectors.pt
+  module_pattern: mlp
+  missing: identity
+
+update:
+  alpha: 1.0
+  lambda_pres: 1.0
+  use_curvature: false
+
+preservation:
+  epsilon_pres: 0.05
+  top_k: 64
+  default_probability: 1.0e-12
+  reduction: seq-mean-token-mean
+  anchor: frozen_base_policy
+
+logging:
+  projector_rank_nullity: true
+  kl_violation_fraction: true
+  preservation_loss: true
+  hvp_skipped: true
+
+ablations:
+  gradient_projection_only:
+    lambda_pres: 0.0
+    use_curvature: false
+  first_order_grit:
+    lambda_pres: 1.0
+    use_curvature: false
+  curvature_grit:
+    lambda_pres: 1.0
+    use_curvature: true
