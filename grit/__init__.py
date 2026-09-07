@@ -15,9 +15,14 @@ from grit.predictor import (
 )
 from grit.projection import (
     ProjectorBuildResult,
+    ProjectorAttachResult,
+    apply_attached_gradient_projection,
     apply_gradient_projection,
+    attach_projectors_to_modules,
+    attached_projectors,
     build_projectors_from_covariances,
     collect_activation_covariances,
+    load_projectors,
     projector_diagnostics,
 )
 from grit.preservation_loss import (
@@ -47,10 +52,14 @@ __all__ = [
     "PredictorStepInfo",
     "ProjectorBuildResult",
     "PreservationLossResult",
+    "ProjectorAttachResult",
     "TrustRegionProjection",
     "aggregate_preservation_loss",
     "assemble_grit_update",
+    "apply_attached_gradient_projection",
     "apply_gradient_projection",
+    "attach_projectors_to_modules",
+    "attached_projectors",
     "build_sparse_support_mask",
     "build_projectors_from_covariances",
     "collect_activation_covariances",
@@ -60,6 +69,7 @@ __all__ = [
     "hessian_vector_product",
     "kl_from_log_probs",
     "linear_weight_parameter_names",
+    "load_projectors",
     "preservation_kl_loss",
     "project_to_kl_ball",
     "project_vector_with_module_projectors",

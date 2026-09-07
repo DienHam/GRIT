@@ -41,6 +41,7 @@ class GritUpdateConfig:
     alpha: float = 1.0
     lambda_pres: float = 1.0
     use_curvature: bool = False
+    hvp_last_linear_layers: int = 0
     missing_projector: str = "identity"
     zero_grad_before_write: bool = True
 
@@ -49,6 +50,7 @@ class GritUpdateConfig:
 class GritUpdateResult:
     """Named gradients and scalar diagnostics from one GRIT update."""
 
+    task_gradients: dict[str, torch.Tensor]
     final_gradients: dict[str, torch.Tensor]
     projected_task_gradients: dict[str, torch.Tensor]
     preservation_gradients: dict[str, torch.Tensor]
@@ -66,7 +68,8 @@ def _zero_like_parameter(parameter: nn.Parameter) -> torch.Tensor:
 def _squared_norm(tensors: Iterable[torch.Tensor]) -> float:
     total = 0.0
     for tensor in tensors:
-        total += float(tensor.detach().float().square().sum().item())
+        norm = torch.linalg.vector_norm(tensor.detach())
+        total += float(norm.item()) ** 2
     return total
 
 
@@ -77,6 +80,7 @@ def _coerce_config(config: GritUpdateConfig | None, **overrides) -> GritUpdateCo
         "alpha": config.alpha,
         "lambda_pres": config.lambda_pres,
         "use_curvature": config.use_curvature,
+        "hvp_last_linear_layers": config.hvp_last_linear_layers,
         "missing_projector": config.missing_projector,
         "zero_grad_before_write": config.zero_grad_before_write,
     }
@@ -91,6 +95,7 @@ def _autograd_gradient_map(
     retain_graph: bool,
     create_graph: bool = False,
     allow_unused: bool = True,
+    detach: bool = True,
 ) -> dict[str, torch.Tensor]:
     tensors = [parameter for _, parameter in parameters]
     gradients = torch.autograd.grad(
@@ -100,10 +105,15 @@ def _autograd_gradient_map(
         create_graph=create_graph,
         allow_unused=allow_unused,
     )
-    return {
-        name: _zero_like_parameter(parameter) if grad is None else grad.detach().clone()
-        for (name, parameter), grad in zip(parameters, gradients, strict=True)
-    }
+    gradient_map: dict[str, torch.Tensor] = {}
+    for (name, parameter), grad in zip(parameters, gradients, strict=True):
+        if grad is None:
+            gradient_map[name] = _zero_like_parameter(parameter)
+        elif detach:
+            gradient_map[name] = grad.detach().clone()
+        else:
+            gradient_map[name] = grad.clone()
+    return gradient_map
 
 
 def _write_gradients(
@@ -148,6 +158,60 @@ def _projector_metrics(
     return metrics
 
 
+def _projected_module_count(
+    model: nn.Module,
+    projectors: Mapping[str, torch.Tensor | ProjectorBuildResult],
+    parameters: Sequence[NamedParameter],
+    module_filter: ModuleFilter,
+    projected_task_gradients: Mapping[str, torch.Tensor],
+) -> float:
+    parameter_names = {name for name, _parameter in parameters}
+    count = 0
+    for module_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        parameter_name = f"{module_name}.weight" if module_name else "weight"
+        if (
+            module_filter(module_name, module)
+            and module_name in projectors
+            and parameter_name in parameter_names
+            and parameter_name in projected_task_gradients
+        ):
+            count += 1
+    return float(count)
+
+
+def _last_projected_linear_weight_parameters(
+    model: nn.Module,
+    projectors: Mapping[str, torch.Tensor | ProjectorBuildResult],
+    parameters: Sequence[NamedParameter],
+    module_filter: ModuleFilter,
+    count: int,
+) -> list[NamedParameter]:
+    if count <= 0:
+        return list(parameters)
+
+    parameter_by_name = dict(parameters)
+    selected_names: list[str] = []
+    for module_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        parameter_name = f"{module_name}.weight" if module_name else "weight"
+        if (
+            module_filter(module_name, module)
+            and module_name in projectors
+            and parameter_name in parameter_by_name
+        ):
+            selected_names.append(parameter_name)
+
+    selected_set = set(selected_names[-count:])
+    return [
+        (name, parameter)
+        for name, parameter in parameters
+        if name in selected_set
+    ]
+
+
 def _preservation_loss_and_metrics(
     result: torch.Tensor | PreservationLossResult,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -183,6 +247,7 @@ def assemble_grit_update(
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
     missing_projector: str | None = None,
+    hvp_last_linear_layers: int | None = None,
     zero_grad_before_write: bool | None = None,
 ) -> GritUpdateResult:
     """Assemble and write the final GRIT gradient to ``parameter.grad``.
@@ -199,6 +264,7 @@ def assemble_grit_update(
         lambda_pres=lambda_pres,
         use_curvature=use_curvature,
         missing_projector=missing_projector,
+        hvp_last_linear_layers=hvp_last_linear_layers,
         zero_grad_before_write=zero_grad_before_write,
     )
     if resolved.alpha < 0:
@@ -209,6 +275,10 @@ def assemble_grit_update(
         raise ValueError(
             f"missing_projector must be 'identity' or 'zero', got {resolved.missing_projector!r}"
         )
+    if resolved.hvp_last_linear_layers < 0:
+        raise ValueError(
+            f"hvp_last_linear_layers must be non-negative, got {resolved.hvp_last_linear_layers}"
+        )
     if module_filter is None:
         module_filter = lambda name, module: default_module_filter(name, module)
     if parameters is None:
@@ -218,6 +288,8 @@ def assemble_grit_update(
         task_loss,
         parameters,
         retain_graph=resolved.use_curvature,
+        create_graph=False,
+        detach=True,
     )
     projected_task_gradients = project_vector_with_module_projectors(
         model,
@@ -248,6 +320,7 @@ def assemble_grit_update(
             gradients=projected_task_gradients,
             parameter_filter=parameter_filter,
             module_filter=module_filter,
+            preserve_autograd_graph=resolved.use_curvature,
         ) as predictor_info:
             preservation_result = preservation_loss_fn()
             preservation_loss, preservation_metrics = _preservation_loss_and_metrics(preservation_result)
@@ -261,6 +334,13 @@ def assemble_grit_update(
     if resolved.use_curvature and resolved.lambda_pres > 0.0:
         from grit.curvature import curvature_corrected_preservation_gradients
 
+        hvp_parameters = _last_projected_linear_weight_parameters(
+            model,
+            projectors,
+            parameters,
+            module_filter,
+            resolved.hvp_last_linear_layers,
+        )
         curvature_result = curvature_corrected_preservation_gradients(
             model,
             task_loss,
@@ -268,11 +348,13 @@ def assemble_grit_update(
             projectors,
             alpha=resolved.alpha,
             parameters=parameters,
+            hvp_parameters=hvp_parameters,
             module_filter=module_filter,
             missing_projector=resolved.missing_projector,
         )
         preservation_correction = curvature_result.gradients
     else:
+        hvp_parameters = []
         preservation_correction = preservation_gradients
 
     final_gradients = {
@@ -291,12 +373,22 @@ def assemble_grit_update(
         "grit/alpha": float(resolved.alpha),
         "grit/lambda_pres": float(resolved.lambda_pres),
         "grit/use_curvature": float(resolved.use_curvature),
+        "grit/hvp_last_linear_layers": float(resolved.hvp_last_linear_layers),
+        "grit/hvp_parameter_count": float(len(hvp_parameters)),
         "grit/hvp_skipped": float(skipped_hvp),
         "grit/task_grad_norm": _squared_norm(list(task_gradients.values())) ** 0.5,
         "grit/projected_task_grad_norm": _squared_norm(list(projected_task_gradients.values())) ** 0.5,
         "grit/preservation_grad_norm": _squared_norm(list(preservation_gradients.values())) ** 0.5,
         "grit/preservation_correction_norm": _squared_norm(list(preservation_correction.values())) ** 0.5,
+        "grit/corrected_preservation_grad_norm": _squared_norm(list(preservation_correction.values())) ** 0.5,
         "grit/final_grad_norm": _squared_norm(list(final_gradients.values())) ** 0.5,
+        "grit/projected_module_count": _projected_module_count(
+            model,
+            projectors,
+            parameters,
+            module_filter,
+            projected_task_gradients,
+        ),
         "grit/predictor_updated_parameters": float(predictor_info.updated_parameters),
         "grit/predictor_update_norm": float(predictor_info.update_norm),
         "grit/predictor_max_update_abs": float(predictor_info.max_update_abs),
@@ -307,12 +399,15 @@ def assemble_grit_update(
         metrics["grit/preservation_loss"] = float(preservation_loss.detach().float().item())
     if curvature_result is not None:
         metrics["grit/hvp_norm"] = float(curvature_result.hvp_norm)
+        metrics["grit/projected_vector_norm"] = float(curvature_result.projected_vector_norm)
         metrics["grit/hvp_projected_vector_norm"] = float(curvature_result.projected_vector_norm)
     else:
         metrics["grit/hvp_norm"] = 0.0
+        metrics["grit/projected_vector_norm"] = 0.0
         metrics["grit/hvp_projected_vector_norm"] = 0.0
 
     return GritUpdateResult(
+        task_gradients=task_gradients,
         final_gradients=final_gradients,
         projected_task_gradients=projected_task_gradients,
         preservation_gradients=preservation_gradients,

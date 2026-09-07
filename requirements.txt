@@ -24,3 +24,15 @@ safetensors
 sentencepiece
 huggingface_hub>=0.30.0,<1.0
 packaging>=20.0
+
+# Minimal verl Phase 1 actor-smoke dependencies. This intentionally avoids the
+# full verl stack in `verl/requirements.txt` because packages such as
+# flash-attn/vllm are CUDA/Linux-oriented and are not needed to test
+# `loss.backward() -> grad_W @ P -> optimizer.step()`.
+codetiming>=1.4.0
+hydra-core>=1.3.2,<1.4
+omegaconf>=2.3.0,<2.4
+ray==2.10.0
+tensordict==0.3.2
+pytest>=8.0.0,<9.0.0
+peft>=0.11.0,<0.18.0

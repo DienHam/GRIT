@@ -249,6 +249,9 @@ def main() -> None:
         "grit/kl_violation_fraction",
         "grit/final_grad_norm",
         "grit/hvp_skipped",
+        "grit/projected_vector_norm",
+        "grit/hvp_norm",
+        "grit/corrected_preservation_grad_norm",
         "grit/projector/rank_mean",
         "grit/projector/nullity_mean",
     ):

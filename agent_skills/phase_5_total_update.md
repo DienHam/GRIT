@@ -2,18 +2,24 @@
 
 ## Goal
 
-Assemble the final GRIT update and expose configs/metrics/ablations.
+Assemble the final GRIT update and expose configs/metrics.
 
 First-order form:
 
 ```text
-final_grad = projected_task_grad - lambda_pres * v
+delta_task = AdamW_task(grad_task)
+term_task = project(delta_task)
+delta_pres = AdamW_pres(v)
+delta_final = alpha * term_task - lambda_pres * delta_pres
 ```
 
 Full form:
 
 ```text
-final_grad = projected_task_grad - lambda_pres * (v + alpha * H P v)
+delta_task = AdamW_task(grad_task)
+term_task = project(delta_task)
+delta_pres = AdamW_pres(v + alpha * H P v)
+delta_final = alpha * term_task - lambda_pres * delta_pres
 ```
 
 ## Source To Compare
@@ -41,11 +47,14 @@ can run first-order GRIT
 can toggle curvature
 logs projection rank/nullity and KL violation fraction
 logs preservation loss and whether HVP was skipped
+logs task AdamW delta projection removal
 ```
 
 ## Debug Notes
 
 - Prefer assembling final gradients explicitly over pretending everything is one scalar loss if manual HVP is used.
 - Keep NSPO-style weight repair as an ablation only, if implemented.
-- Optimizer state should receive the final GRIT gradient, not the unprojected task gradient.
+- The task and preservation AdamW delta states should be separate.
+- Project only the task AdamW delta; do not project the preservation correction.
+- Do not call a final optimizer step after manually applying the split deltas.
 - The frozen base policy used by preservation must not be updated.

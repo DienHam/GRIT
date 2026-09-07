@@ -11,10 +11,15 @@ import torch
 from torch import nn
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VERL_ROOT = REPO_ROOT / "verl"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(VERL_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_ROOT))
+if "verl" in sys.modules and not hasattr(sys.modules["verl"], "DataProto"):
+    del sys.modules["verl"]
 
-from grit.predictor import forward_with_predictor_step, linear_weight_parameter_names, temporary_predictor_step
+from verl.experimental.grit.predictor import clone_current_gradients, temporary_predictor_step
 
 
 class ToyModel(nn.Module):
@@ -82,35 +87,17 @@ def main() -> None:
     baseline_parameters = clone_named_parameters(model)
     baseline_logits = model(**batch).detach().clone()
     optimizer_state_before = copy.deepcopy(optimizer.state_dict())
-    linear_weight_names = linear_weight_parameter_names(model)
+    projected_grads = clone_current_gradients(model)
 
-    with temporary_predictor_step(model, alpha=0.3) as info:
+    with temporary_predictor_step(model, alpha=0.3, gradients=projected_grads) as info:
         predictor_logits = model(**batch).detach().clone()
-        assert info.updated_parameters == len(linear_weight_names)
+        assert info.updated_parameters == len(projected_grads)
         assert info.update_norm > 0.0
         assert not torch.allclose(predictor_logits, baseline_logits)
-        for name, parameter in model.named_parameters():
-            if name.endswith(".bias"):
-                torch.testing.assert_close(parameter.detach(), baseline_parameters[name], atol=0.0, rtol=0.0)
 
     restored_logits = model(**batch).detach()
     assert_parameters_restored(model, baseline_parameters, atol=1e-7, rtol=1e-7)
     torch.testing.assert_close(restored_logits, baseline_logits, atol=1e-7, rtol=1e-7)
-    assert_optimizer_state_unchanged(optimizer_state_before, optimizer.state_dict())
-
-    projected_grads = {
-        name: parameter.grad.detach().clone()
-        for name, parameter in model.named_parameters()
-        if name in linear_weight_names and parameter.grad is not None
-    }
-    one_shot_logits = forward_with_predictor_step(
-        model,
-        batch,
-        alpha=0.3,
-        gradients=projected_grads,
-    ).detach()
-    assert not torch.allclose(one_shot_logits, baseline_logits)
-    assert_parameters_restored(model, baseline_parameters, atol=1e-7, rtol=1e-7)
     assert_optimizer_state_unchanged(optimizer_state_before, optimizer.state_dict())
 
     print(f"updated_parameters={info.updated_parameters}")

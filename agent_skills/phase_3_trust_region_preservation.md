@@ -22,6 +22,8 @@ Likely files:
 - `grit/trust_region.py`
 - `grit/preservation_loss.py`
 - `test_function/check_trust_region_preservation.py`
+- `verl/verl/experimental/grit/preservation.py`
+- `verl/verl/workers/actor/dp_actor.py`
 - later integration with TROLL's `SdtrplLayer` or equivalent projection layer if vendored
 
 ## Required Checks
@@ -38,6 +40,8 @@ violating tokens solve eta* > 0 by bracketing/bisection
 projection uses geometric interpolation in log-prob space
 preservation gradients flow only through pi_tilde; pi_proj/pi_interpolation is stop-gradient
 default loss aggregation is seq-mean-token-mean: average token loss within each response, then average sequences
+verl integration evaluates preservation inside theta_tilde from Phase 2, then restores theta before optimizer step
+verl logs grit/preservation_loss and grit/kl_violation_fraction
 ```
 
 ## Debug Notes
@@ -65,3 +69,5 @@ L_pres = KL(pi_tilde || stopgrad(pi_proj))
 - Sparse projection should preserve the selected response token even if it is not top-K.
 - Sparse KL should assign dropped tokens a positive default probability `p_d > 0`; do not silently set dropped-token mass to zero.
 - Match the proposal's `1/|o| sum_t` preservation objective and TROLL/verl's `seq-mean-token-mean` aggregation by default. `token-mean` may be kept only as an explicit ablation/debug mode because it overweights long responses.
+- In `verl`, compute task gradients, project them, enter the Phase 2 `theta_tilde` context, backward the preservation loss there, restore `theta`, then combine `projected_task_grad - lambda_pres * grad_{theta_tilde} L_pres`.
+- Tensorized `D_preserve` batches should expose `input_ids`, `attention_mask`, `position_ids`, `responses`, and `response_mask`, matching the actor micro-batch surface.

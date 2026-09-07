@@ -1,6 +1,10 @@
 # GRIT
 Official repository for the paper "GRIT: Gradient Projection Meets Trust-Region Anchoring for Forgetting-Resistant Reinforcement Learning"
 
+Start from `WORKFLOW.md` when running or modifying the repo. It is the compact
+map of the current artifact flow, phase contracts, training commands, metrics,
+and Google Drive sync expectations.
+
 ## Phase 1: Null-Space Gradient Projection
 
 Phase 1 implements the NSPO-theory gradient projection primitive:
@@ -32,6 +36,28 @@ scripts/run_build_projectors.sh \
   --max-length 256 \
   --output-path artifacts/projectors.pt
 ```
+
+When wiring Phase 1 into `verl`, load and attach the saved projectors once in
+the actor worker, then project gradients after the RL/task backward:
+
+```python
+from verl.experimental.grit.projector import (
+    attach_projectors_to_mlp_linears,
+    load_projectors,
+    project_actor_mlp_gradients,
+)
+
+projectors = load_projectors("artifacts/projectors.pt", map_location="cpu")
+attach_projectors_to_mlp_linears(actor_module, projectors)
+
+task_loss.backward()
+projection_metrics = project_actor_mlp_gradients(actor_module)
+```
+
+Call this before gradient clipping and `optimizer.step()`. This is gradient
+projection only; do not use NSPO's periodic weight repair as the GRIT Phase 1
+mechanism. With FSDP1, enable `actor_rollout_ref.actor.fsdp_config.use_orig_params=True`
+so `Linear.weight.grad` exists for projection.
 
 ## Phase 2: Predictor Weights
 
@@ -82,6 +108,29 @@ Run the toy preservation check:
 
 ```bash
 /Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_trust_region_preservation.py
+```
+
+`verl` integration evaluates Phase 3 at the Phase 2 predictor point. Enable
+top-level `grit.preservation.enable` (passed into the actor config), provide a
+tensorized `D_preserve` file with `input_ids`, `attention_mask`,
+`position_ids`, `responses`, and `response_mask`, and set `base_model_path`
+for the frozen `pi_base`. The actor computes the PPO/task backward, projects
+the task gradients, temporarily applies
+`theta_tilde = theta - alpha * projected_task_grad`, evaluates
+`KL(pi_tilde || pi_base)` through the same trust-region projection loss,
+restores `theta`, and combines the final gradient with
+`lambda_pres * grad_{theta_tilde} L_pres`. It logs:
+
+```text
+grit/preservation_loss
+grit/kl_violation_fraction
+```
+
+Run the actor integration check:
+
+```bash
+/Users/apple/miniconda3/envs/grit-qwen3/bin/python -m pytest \
+  verl/tests/experimental/grit/test_phase3_preservation_actor_on_cpu.py -q
 ```
 
 ## Phase 4: Curvature HVP
@@ -139,6 +188,49 @@ Run the total-update check:
 
 ```bash
 /Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_total_update.py
+```
+
+## NSPO-Style GRPO Safety Task Objective
+
+For the real NSPO-style task gradient, `D_task` supplies prompts only. The
+current policy rolls out `G` responses per prompt, a Llama/Llama-Guard style
+safety model scores each `(prompt, response)` pair, and the reward is:
+
+```text
+r_{i,g} =  0   if response is safe
+r_{i,g} = -1   if response is unsafe
+```
+
+The group advantage is normalized within each prompt group:
+
+```text
+A_{i,g} = (r_{i,g} - mean_g r_{i,g}) / (std_g r_{i,g} + eps)
+```
+
+The task loss is clipped GRPO/PPO without an extra task KL penalty:
+
+```text
+L_task = - mean_{i,g} min(
+    rho_{i,g} A_{i,g},
+    clip(rho_{i,g}, 1-epsilon, 1+epsilon) A_{i,g}
+)
+
+rho_{i,g} = pi_theta(o_{i,g} | q_i) / pi_old(o_{i,g} | q_i)
+```
+
+GRIT then treats this as the task gradient. Protected Linear weights use:
+
+```text
+grad_W = grad_W_GRPO_clipped @ P
+```
+
+Unprotected parameters keep their normal clipped-GRPO gradient. Preservation
+KL remains separate in Phase 3 and is anchored to the frozen base policy.
+
+Run the objective sanity check:
+
+```bash
+/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_grpo_safety_objective.py
 ```
 
 ## Real-Model Smoke Workflow: Qwen2.5-0.5B + PKU-SafeRLHF

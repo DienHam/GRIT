@@ -1,0 +1,20 @@
+{
+  "models": [
+    {
+      "name": "grit",
+      "path": "/path/to/grit/checkpoint",
+      "cuda_visible_devices": "0"
+    },
+    {
+      "name": "nspo",
+      "path": "/path/to/nspo/checkpoint",
+      "cuda_visible_devices": "0"
+    },
+    {
+      "name": "base",
+      "path": "/path/to/base/instruct/model",
+      "cuda_visible_devices": "0"
+    }
+  ]
+}
+

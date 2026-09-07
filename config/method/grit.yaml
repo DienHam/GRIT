@@ -11,6 +11,12 @@ update:
   use_curvature: false
 
 preservation:
+  enable: false
+  dataset_path: null
+  micro_batch_size: null
+  base_model_path: null
+  base_model_dtype: null
+  trust_remote_code: false
   epsilon_pres: 0.05
   top_k: 64
   default_probability: 1.0e-12

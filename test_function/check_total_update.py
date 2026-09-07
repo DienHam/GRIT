@@ -169,6 +169,7 @@ def main() -> None:
     assert first_order.curvature is None
     assert first_order.metrics["grit/preservation_loss"] > 0.0
     assert first_order.metrics["grit/kl_violation_fraction"] > 0.0
+    assert first_order.metrics["grit/projected_module_count"] == 1.0
     assert_parameters_restored(model, baseline_parameters)
 
     curvature = run_update(
@@ -181,7 +182,9 @@ def main() -> None:
     assert curvature.curvature is not None
     assert not curvature.curvature.skipped_hvp
     assert curvature.metrics["grit/hvp_skipped"] == 0.0
+    assert curvature.metrics["grit/projected_vector_norm"] > 0.0
     assert curvature.metrics["grit/hvp_norm"] > 0.0
+    assert curvature.metrics["grit/corrected_preservation_grad_norm"] > 0.0
     assert "grit/projector/mlp/rank" in curvature.metrics
     assert "grit/projector/mlp/nullity" in curvature.metrics
     assert_parameters_restored(model, baseline_parameters)
@@ -195,10 +198,17 @@ def main() -> None:
     print("curvature_toggle=True")
     print(f"projection_rank={curvature.metrics['grit/projector/mlp/rank']:.0f}")
     print(f"projection_nullity={curvature.metrics['grit/projector/mlp/nullity']:.0f}")
+    print(f"projected_module_count={curvature.metrics['grit/projected_module_count']:.0f}")
     print(f"kl_violation_fraction={first_order.metrics['grit/kl_violation_fraction']:.6f}")
     print(f"preservation_loss={first_order.metrics['grit/preservation_loss']:.8f}")
     print(f"hvp_skipped_first_order={bool(first_order.metrics['grit/hvp_skipped'])}")
     print(f"hvp_skipped_curvature={bool(curvature.metrics['grit/hvp_skipped'])}")
+    print(f"projected_vector_norm={curvature.metrics['grit/projected_vector_norm']:.8f}")
+    print(f"hvp_norm={curvature.metrics['grit/hvp_norm']:.8f}")
+    print(
+        "corrected_preservation_grad_norm="
+        f"{curvature.metrics['grit/corrected_preservation_grad_norm']:.8f}"
+    )
     print(f"final_grad_norm={curvature.metrics['grit/final_grad_norm']:.8f}")
 
 

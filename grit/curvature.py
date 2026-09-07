@@ -64,13 +64,17 @@ def _zero_like_parameter(parameter: nn.Parameter) -> torch.Tensor:
 def _squared_norm(tensors: Iterable[torch.Tensor]) -> float:
     total = 0.0
     for tensor in tensors:
-        total += float(tensor.detach().float().square().sum().item())
+        norm = torch.linalg.vector_norm(tensor.detach())
+        total += float(norm.item()) ** 2
     return total
 
 
 def _is_all_zero(tensors: Iterable[torch.Tensor]) -> bool:
     for tensor in tensors:
-        if bool(torch.count_nonzero(tensor.detach()).item()):
+        detached = tensor.detach()
+        if detached.numel() == 0:
+            continue
+        if bool((detached.max() != 0).item()) or bool((detached.min() != 0).item()):
             return False
     return True
 
@@ -209,6 +213,7 @@ def curvature_corrected_preservation_gradients(
     parameters: Sequence[NamedParameter] | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
+    hvp_parameters: Sequence[NamedParameter] | None = None,
     missing_projector: str = "identity",
 ) -> CurvatureCorrectionResult:
     """Return ``v + alpha * H_task P v`` as named gradients.
@@ -247,11 +252,22 @@ def curvature_corrected_preservation_gradients(
         missing=missing_projector,
     )
 
-    skipped_hvp = alpha == 0.0 or _is_all_zero(projected_vector.values())
+    if hvp_parameters is None:
+        hvp_parameters = parameters
+    hvp_parameter_names = {name for name, _parameter in hvp_parameters}
+    hvp_projected_vector = {
+        name: projected_vector[name]
+        for name in hvp_parameter_names
+        if name in projected_vector
+    }
+
+    skipped_hvp = alpha == 0.0 or not hvp_parameters or _is_all_zero(hvp_projected_vector.values())
     if skipped_hvp:
         hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
     else:
-        hvp = hessian_vector_product(task_loss, parameters, projected_vector)
+        partial_hvp = hessian_vector_product(task_loss, hvp_parameters, hvp_projected_vector)
+        hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
+        hvp.update(partial_hvp)
 
     gradients = {
         name: first_order[name] + hvp[name].to(first_order[name]).mul(alpha)

@@ -1,16 +1,23 @@
 """Null-space projector utilities for GRIT Phase 1.
 
-The core update implemented here is the NSPO-theory form:
+The default update implemented here is the NSPO-theory form:
 
     grad_W <- grad_W @ P
 
 for protected Linear weights W with shape [out_features, in_features].
+
+Some experiments instead project the realized optimizer delta after AdamW:
+
+    delta_W <- delta_W @ P
+
+This is a step-local update projection, not NSPO's periodic base repair.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from pathlib import Path
+from typing import Callable, Iterable, Mapping
 
 import torch
 from torch import nn
@@ -28,6 +35,16 @@ class ProjectorBuildResult:
     threshold_value: float
     nullity: int
     rank: int
+
+
+@dataclass(frozen=True)
+class ProjectorAttachResult:
+    """Summary from attaching projector tensors to model modules."""
+
+    attached: tuple[str, ...]
+    missing: tuple[str, ...]
+    unexpected: tuple[str, ...]
+    shape_mismatch: tuple[str, ...]
 
 
 def default_module_filter(name: str, module: nn.Module, pattern: str = "mlp") -> bool:
@@ -105,6 +122,120 @@ def collect_activation_covariances(
         model.train(was_training)
 
     return {name: cov.cpu() for name, cov in covariances.items()}
+
+
+def _unwrap_projector(raw_projector: torch.Tensor | ProjectorBuildResult) -> torch.Tensor:
+    return raw_projector.projector if isinstance(raw_projector, ProjectorBuildResult) else raw_projector
+
+
+def load_projectors(
+    path: str | Path,
+    *,
+    map_location: str | torch.device = "cpu",
+    projector_key: str = "projectors",
+) -> dict[str, torch.Tensor]:
+    """Load a projector artifact saved by ``scripts/build_projectors.py``.
+
+    The expected artifact shape is ``{"projectors": {module_name: P}}``. A raw
+    ``{module_name: P}`` mapping is also accepted for easier tests and ablations.
+    """
+
+    payload = torch.load(Path(path), map_location=map_location)
+    if isinstance(payload, Mapping) and projector_key in payload:
+        payload = payload[projector_key]
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"projector artifact must contain a mapping, got {type(payload).__name__}")
+
+    projectors: dict[str, torch.Tensor] = {}
+    for name, projector in payload.items():
+        if not isinstance(name, str):
+            raise TypeError(f"projector name must be str, got {type(name).__name__}")
+        if isinstance(projector, ProjectorBuildResult):
+            projector = projector.projector
+        if not torch.is_tensor(projector):
+            raise TypeError(f"projector for {name!r} must be a Tensor, got {type(projector).__name__}")
+        if projector.ndim != 2 or projector.shape[0] != projector.shape[1]:
+            raise ValueError(f"projector for {name!r} must be square, got shape {tuple(projector.shape)}")
+        projectors[name] = projector.detach().cpu()
+    return projectors
+
+
+def attach_projectors_to_modules(
+    model: nn.Module,
+    projectors: Mapping[str, torch.Tensor | ProjectorBuildResult],
+    *,
+    module_filter: ModuleFilter | None = None,
+    attribute_name: str = "grit_projector",
+    strict: bool = True,
+) -> ProjectorAttachResult:
+    """Attach projector tensors to matching Linear modules.
+
+    This mirrors the way a ``verl`` actor worker should load projectors once
+    during model setup. The actual optimizer-facing operation remains gradient
+    projection after task-loss backward, not NSPO's periodic weight repair.
+    """
+
+    if module_filter is None:
+        module_filter = lambda name, module: default_module_filter(name, module)
+
+    module_by_name = dict(model.named_modules())
+    target_names = [
+        name for name, module in module_by_name.items() if isinstance(module, nn.Linear) and module_filter(name, module)
+    ]
+    attached: list[str] = []
+    missing: list[str] = []
+    shape_mismatch: list[str] = []
+
+    for name in target_names:
+        module = module_by_name[name]
+        if name not in projectors:
+            missing.append(name)
+            continue
+        projector = _unwrap_projector(projectors[name]).detach().cpu()
+        expected_shape = (module.in_features, module.in_features)
+        if tuple(projector.shape) != expected_shape:
+            shape_mismatch.append(f"{name}: got {tuple(projector.shape)}, expected {expected_shape}")
+            continue
+        setattr(module, attribute_name, projector)
+        attached.append(name)
+
+    target_name_set = set(target_names)
+    unexpected = sorted(name for name in projectors.keys() if name not in target_name_set)
+    result = ProjectorAttachResult(
+        attached=tuple(attached),
+        missing=tuple(missing),
+        unexpected=tuple(unexpected),
+        shape_mismatch=tuple(shape_mismatch),
+    )
+    if strict and (result.missing or result.shape_mismatch):
+        raise ValueError(
+            "failed to attach all GRIT projectors: "
+            f"missing={list(result.missing)}, shape_mismatch={list(result.shape_mismatch)}"
+        )
+    return result
+
+
+def attached_projectors(
+    model: nn.Module,
+    *,
+    module_filter: ModuleFilter | None = None,
+    attribute_name: str = "grit_projector",
+) -> dict[str, torch.Tensor]:
+    """Return projectors previously attached to protected modules."""
+
+    if module_filter is None:
+        module_filter = lambda name, module: default_module_filter(name, module)
+
+    projectors: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        if not module_filter(name, module) or not isinstance(module, nn.Linear):
+            continue
+        projector = getattr(module, attribute_name, None)
+        if projector is not None:
+            if not torch.is_tensor(projector):
+                raise TypeError(f"attached projector {attribute_name!r} on {name!r} must be a Tensor")
+            projectors[name] = projector
+    return projectors
 
 
 def build_projectors_from_covariances(
@@ -185,8 +316,13 @@ def apply_gradient_projection(
             continue
 
         raw_projector = projectors[name]
-        projector = raw_projector.projector if isinstance(raw_projector, ProjectorBuildResult) else raw_projector
+        projector = _unwrap_projector(raw_projector)
         projector = projector.to(device=module.weight.grad.device, dtype=module.weight.grad.dtype)
+        if tuple(projector.shape) != (module.weight.shape[1], module.weight.shape[1]):
+            raise ValueError(
+                f"projector for {name!r} has shape {tuple(projector.shape)}, "
+                f"expected {(module.weight.shape[1], module.weight.shape[1])}"
+            )
 
         before = module.weight.grad.detach().float().norm()
         module.weight.grad.copy_(module.weight.grad.matmul(projector))
@@ -196,6 +332,22 @@ def apply_gradient_projection(
         metrics[f"{name}.grad_norm_after"] = float(after.item())
 
     return metrics
+
+
+def apply_attached_gradient_projection(
+    model: nn.Module,
+    *,
+    module_filter: ModuleFilter | None = None,
+    attribute_name: str = "grit_projector",
+) -> dict[str, float]:
+    """Apply ``grad_W <- grad_W @ P`` using projectors attached to modules."""
+
+    projectors = attached_projectors(
+        model,
+        module_filter=module_filter,
+        attribute_name=attribute_name,
+    )
+    return apply_gradient_projection(model, projectors, module_filter=module_filter)
 
 
 def projector_diagnostics(projector: torch.Tensor) -> dict[str, float]:

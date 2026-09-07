@@ -1,0 +1,186 @@
+{
+  "safety": [
+    {
+      "name": "AdvB",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/advbench.jsonl",
+      "prompt_key": "prompt",
+      "judge": "heuristic",
+      "notes": "AdvBench harmful-behavior prompts. Reference: https://github.com/thunlp/Advbench"
+    },
+    {
+      "name": "PKU-Safe",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/pku_saferlhf.jsonl",
+      "prompt_key": "prompt",
+      "judge": "heuristic",
+      "notes": "PKU-SafeRLHF safety split. Reference: https://huggingface.co/datasets/PKU-Alignment/PKU-SafeRLHF"
+    },
+    {
+      "name": "HarmB",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/harmbench.jsonl",
+      "prompt_key": "prompt",
+      "judge": "heuristic",
+      "notes": "HarmBench behaviors converted to prompt JSONL. Reference: https://github.com/centerforaisafety/HarmBench"
+    },
+    {
+      "name": "JailbreakB",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/jailbreakbench.jsonl",
+      "prompt_key": "goal",
+      "judge": "heuristic",
+      "notes": "JailbreakBench behavior prompts. Reference: https://jailbreakbench.github.io/"
+    },
+    {
+      "name": "SORRY",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/sorry_bench.jsonl",
+      "prompt_key": "prompt",
+      "judge": "heuristic",
+      "notes": "SORRY-Bench prompts converted to prompt JSONL. Reference: https://sorry-bench.github.io/"
+    },
+    {
+      "name": "HarmQA",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/harmfulqa.jsonl",
+      "prompt_key": "question",
+      "judge": "heuristic",
+      "notes": "HarmfulQA harmful questions. Reference: https://huggingface.co/datasets/declare-lab/HarmfulQA"
+    },
+    {
+      "name": "ALERT",
+      "metric": "ASR-%",
+      "higher_is_better": false,
+      "runner": "grit_safety",
+      "dataset_path": "data/eval/safety/alert.jsonl",
+      "prompt_key": "prompt",
+      "judge": "heuristic",
+      "notes": "ALERT red-team prompts. Reference: https://github.com/Babelscape/ALERT"
+    }
+  ],
+  "general": [
+    {
+      "name": "MMLU",
+      "metric": "Accuracy-%",
+      "higher_is_better": true,
+      "runner": "lm_eval",
+      "command": [
+        "lm_eval",
+        "--model",
+        "hf",
+        "--model_args",
+        "pretrained={model_path},dtype=bfloat16,trust_remote_code=True",
+        "--tasks",
+        "mmlu",
+        "--batch_size",
+        "auto",
+        "--output_path",
+        "{output_dir}"
+      ],
+      "notes": "Reference: https://huggingface.co/datasets/cais/mmlu and https://github.com/EleutherAI/lm-evaluation-harness"
+    },
+    {
+      "name": "GSM8K",
+      "metric": "Accuracy-%",
+      "higher_is_better": true,
+      "runner": "lm_eval",
+      "command": [
+        "lm_eval",
+        "--model",
+        "hf",
+        "--model_args",
+        "pretrained={model_path},dtype=bfloat16,trust_remote_code=True",
+        "--tasks",
+        "gsm8k",
+        "--batch_size",
+        "auto",
+        "--output_path",
+        "{output_dir}"
+      ],
+      "notes": "GSM8K via lm-evaluation-harness, matching the NSPO wrapper style."
+    },
+    {
+      "name": "SuperGPQA",
+      "metric": "Accuracy-%",
+      "higher_is_better": true,
+      "runner": "official_supergpqa",
+      "command": [
+        "bash",
+        "-lc",
+        "cd ${SUPERGPQA_HOME:?set SUPERGPQA_HOME} && python infer/infer.py --config config/config_default.yaml --split SuperGPQA-all --mode zero-shot --model_name {model_path} --output_dir {output_dir}/raw --batch_size 1000 --use_accel --index 0 --world_size 1 && python eval/eval.py --evaluate_all --excel_output --json_output --output_dir {output_dir}/raw --save_dir {output_dir}/scored"
+      ],
+      "notes": "Reference: https://huggingface.co/datasets/m-a-p/SuperGPQA and https://supergpqa.github.io/"
+    },
+    {
+      "name": "AlpacaEval",
+      "metric": "WR-%",
+      "higher_is_better": true,
+      "runner": "official_alpaca_eval",
+      "command": [
+        "bash",
+        "-lc",
+        "python eval_benchmarks/tools/generate_alpaca_outputs.py --model-path {model_path} --model-name {model_name} --output-path {output_dir}/model_outputs.json --batch-size 128 && alpaca_eval --model_outputs {output_dir}/model_outputs.json --output_path {output_dir}/alpaca_eval"
+      ],
+      "notes": "Reference: https://github.com/tatsu-lab/alpaca_eval"
+    },
+    {
+      "name": "MATH",
+      "metric": "Accuracy-%",
+      "higher_is_better": true,
+      "runner": "official_math",
+      "command": [
+        "bash",
+        "-lc",
+        "cd ${MATH_EVAL_HOME:?set MATH_EVAL_HOME} && bash sh/eval.sh qwen25-math-cot {model_path}"
+      ],
+      "notes": "Reference wrapper compatible with Qwen2.5-Math/MathBench style evaluation."
+    },
+    {
+      "name": "OlympiadBench",
+      "metric": "Accuracy-%",
+      "higher_is_better": true,
+      "runner": "official_olympiadbench",
+      "command": [
+        "bash",
+        "-lc",
+        "cd ${OLYMPIADBENCH_HOME:?set OLYMPIADBENCH_HOME} && python eval.py --model {model_path} --output_dir {output_dir}"
+      ],
+      "notes": "Reference: https://huggingface.co/datasets/Hothan/OlympiadBench and https://github.com/OpenBMB/OlympiadBench"
+    },
+    {
+      "name": "LiveCodeBench",
+      "metric": "Pass@1-%",
+      "higher_is_better": true,
+      "runner": "official_livecodebench",
+      "command": [
+        "python",
+        "-m",
+        "lcb_runner.runner.main",
+        "--model",
+        "{model_path}",
+        "--scenario",
+        "codegeneration",
+        "--evaluate",
+        "--release_version",
+        "release_v6",
+        "--output_dir",
+        "{output_dir}"
+      ],
+      "notes": "Reference: https://huggingface.co/livecodebench and https://livecodebench.github.io/"
+    }
+  ]
+}
+

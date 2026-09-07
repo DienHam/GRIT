@@ -70,6 +70,7 @@ def temporary_predictor_step(
     gradients: GradientMap | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
+    preserve_autograd_graph: bool = False,
 ) -> Iterator[PredictorStepInfo]:
     """Temporarily move ``model`` to ``theta_tilde`` and restore on exit.
 
@@ -83,6 +84,10 @@ def temporary_predictor_step(
             the Phase 1 projector surface.
         module_filter: Optional predicate to restrict Linear modules when
             ``parameter_filter`` is omitted.
+        preserve_autograd_graph: If true, apply and restore the temporary delta
+            without incrementing parameter version counters. This is needed by
+            Phase 4 because the task-loss graph must remain valid for the later
+            Hessian-vector product after ``theta`` has been restored.
 
     Yields:
         A small diagnostics object describing the temporary update.
@@ -120,7 +125,10 @@ def temporary_predictor_step(
                 )
 
             delta = grad.detach().to(device=parameter.device, dtype=parameter.dtype).mul(-alpha)
-            parameter.add_(delta)
+            if preserve_autograd_graph:
+                parameter.data.add_(delta)
+            else:
+                parameter.add_(delta)
             deltas.append((parameter, delta))
 
             delta_float = delta.float()
@@ -138,7 +146,10 @@ def temporary_predictor_step(
     finally:
         with torch.no_grad():
             for parameter, delta in reversed(deltas):
-                parameter.sub_(delta)
+                if preserve_autograd_graph:
+                    parameter.data.sub_(delta)
+                else:
+                    parameter.sub_(delta)
 
 
 def forward_with_predictor_step(
@@ -149,6 +160,7 @@ def forward_with_predictor_step(
     gradients: GradientMap | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
+    preserve_autograd_graph: bool = False,
 ):
     """Run one forward pass at ``theta_tilde`` and restore ``theta``."""
 
@@ -158,5 +170,6 @@ def forward_with_predictor_step(
         gradients=gradients,
         parameter_filter=parameter_filter,
         module_filter=module_filter,
+        preserve_autograd_graph=preserve_autograd_graph,
     ):
         return model(**batch)
