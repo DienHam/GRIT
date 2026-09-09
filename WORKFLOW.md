@@ -20,19 +20,20 @@ D_task prompt
 
 Current smoke target:
 
-The explicit NSPO-domain preservation preparation is documented in
+Use the explicit NSPO-domain preservation path documented in
 [`docs/preservation_data.md`](docs/preservation_data.md). It samples AlpacaFarm,
-GSM8K and LeetCodeDataset, then optionally generates frozen-base response contexts.
-Use its generated context artifact and rebuilt projectors for response-level KL.
-The legacy task preparation below still defaults to PKU-SafeRLHF preservation
-unless a separate preservation source is supplied.
+GSM8K and LeetCodeDataset, generates frozen-base response contexts, and uses the
+same context artifact for rebuilt projectors and response-level KL. The older
+PKU-SafeRLHF text-only preservation file remains supported for compatibility, but
+it is not the primary preservation artifact for this target.
 
 ```text
-Task dataset:      PKU-Alignment/PKU-SafeRLHF, 11K task prompts
-Preserve dataset:  1,000 prompts in data/grit_qwen2_5_0_5b/preserve_1000.parquet
-Policy model:      Qwen/Qwen2.5-0.5B-Instruct
-Safety model:      Qwen/Qwen3Guard-Gen-0.6B
-Projectors:        artifacts/qwen2_5_0_5b_projectors.pt
+Task dataset:       PKU-Alignment/PKU-SafeRLHF, 11K task prompts
+Preserve prompts:   334 AlpacaFarm + 333 GSM8K + 333 LeetCodeDataset
+Preserve contexts:  data/preservation/qwen2_5_0_5b/preserve_contexts.parquet
+Policy/base model:  Qwen/Qwen2.5-0.5B-Instruct at one pinned revision
+Safety model:       Qwen/Qwen3Guard-Gen-0.6B
+Projectors:         rebuilt from the generated preservation contexts
 ```
 
 ## Repository Layout
@@ -42,6 +43,7 @@ grit/                       Core GRIT math outside verl
 scripts/                    CLI entrypoints for data, projectors, smoke, train
 test_function/              Small focused checks for each algorithm piece
 config/method/grit.yaml     Default method knobs and ablations
+config/preservation/        Pinned preservation sources, counts, and seed
 agent_skills/               Phase-by-phase implementation cards
 verl/                       Vendored verl path with GRIT integration
 eval_benchmarks/            Evaluation utilities and benchmark runners
@@ -67,20 +69,49 @@ They can be deleted at any time.
 flowchart TD
     A["PKU-SafeRLHF"] --> B["scripts/prepare_grit_data.py"]
     B --> C["data/.../task_train.parquet"]
-    B --> D["data/.../preserve_1000.parquet"]
-    D --> E["scripts/build_projectors.py"]
-    E --> F["artifacts/...projectors.pt"]
-    C --> G["scripts/train_grit_dpo.py"]
-    D --> G
-    F --> G
-    H["Qwen2.5 policy"] --> G
-    I["Qwen3Guard safety model"] --> G
-    G --> J["checkpoints/.../step_xxxxxx"]
-    J --> K["optional Hugging Face Hub push"]
+    B --> L["legacy text-only preserve_1000.parquet"]
+    D["Pinned AlpacaFarm + GSM8K + LeetCodeDataset files"] --> E["prepare_preservation_data.py sample"]
+    E --> F["preserve_prompts.parquet"]
+    F --> G["prepare_preservation_data.py generate with frozen base"]
+    G --> H["preserve_contexts.parquet + manifest"]
+    H --> I["scripts/build_projectors.py"]
+    I --> J["artifacts/...projectors.pt"]
+    C --> K["scripts/train_grit_dpo.py"]
+    H --> K
+    J --> K
+    L -. "compatibility path" .-> K
+    M["Qwen2.5 policy and frozen base"] --> K
+    N["Qwen3Guard safety model"] --> K
+    K --> O["checkpoints/.../step_xxxxxx"]
+    O --> P["optional Hugging Face Hub push"]
 ```
 
 Do not commit `data/`, `artifacts/`, or `checkpoints/`. They are runtime
 inputs/outputs.
+
+### Preservation Data Contract
+
+The reproducible NSPO-domain mix is configured in
+`config/preservation/nspo_mix.json`. Its engineering defaults are seed `66` and
+the `334/333/333` allocation above; they are not a claim that the exact NSPO
+sample list has been reconstructed.
+
+Preparation must satisfy all of these conditions:
+
+```text
+- Read pinned, non-evaluation source files and retain source provenance.
+- Normalize and deduplicate prompts globally; fail if any domain quota is unmet.
+- Refuse to overwrite an existing output directory.
+- Write the final parquet and completion manifest only after a stage succeeds.
+- Retain contexts.partial.jsonl when generation is interrupted; resume is not supported.
+```
+
+Frozen-base generation must use one resolved base-model revision and its chat
+template. Each generated row stores exact `input_ids`, `response_start`,
+`response_mask`, the base model/revision, tokenizer fingerprint, and source
+metadata. Training must reject a tokenizer or base-revision mismatch and must
+reject truncation that removes every response token. Preservation KL is computed
+only over response tokens. The legacy text-only loader remains supported.
 
 ## Task Objective
 
@@ -172,8 +203,10 @@ Temporarily move to the point after the projected task step:
 theta_tilde = theta - alpha * projected_task_grad
 ```
 
-Forward preservation data at `theta_tilde`, then restore `theta`. This must not
-call `optimizer.step()` and must not leave parameters changed.
+Forward preservation data at `theta_tilde`, then restore `theta`. For generated
+contexts, reuse the stored token IDs and response mask rather than retokenizing
+the decoded text. This must not call `optimizer.step()` and must not leave
+parameters changed.
 
 Main files:
 
@@ -204,6 +237,10 @@ detached projected distribution:
 ```text
 L_pres = KL(pi_tilde || stopgrad(pi_proj))
 ```
+
+For generated preservation contexts, evaluate this loss only where the shifted
+response mask is active. Padding and prompt tokens must never contribute to the
+preservation loss. Text-only preservation data uses the legacy all-token mask.
 
 Main files:
 
@@ -269,14 +306,34 @@ config/method/grit.yaml
 
 ## Training Entrypoints
 
-Build projectors:
+Prepare the pinned 1,000-prompt NSPO-domain pool:
+
+```bash
+python scripts/prepare_preservation_data.py sample
+```
+
+Generate frozen-base contexts. Start with the short smoke command in
+`docs/preservation_data.md`, then run the complete artifact:
+
+```bash
+python scripts/prepare_preservation_data.py generate \
+  --prompts data/preservation/nspo_mix/preserve_prompts.parquet \
+  --output-dir data/preservation/qwen2_5_0_5b \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --max-prompt-length 2048 \
+  --max-new-tokens 256
+```
+
+Use the resolved model revision recorded in the generation manifest for the
+projector builder and trainer. Rebuild projectors from the generated contexts:
 
 ```bash
 scripts/run_build_projectors.sh \
   --model-path Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset-path data/grit_qwen2_5_0_5b/preserve_1000.parquet \
+  --dataset-path data/preservation/qwen2_5_0_5b/preserve_contexts.parquet \
   --text-column text \
-  --output-path artifacts/qwen2_5_0_5b_projectors.pt
+  --max-length 2304 \
+  --output-path <new-projector-artifact>
 ```
 
 Run first-order GRIT with GRPO safety:
@@ -284,6 +341,8 @@ Run first-order GRIT with GRPO safety:
 ```bash
 TASK_OBJECTIVE=grpo_safety \
 SAFETY_MODEL_PATH="Qwen/Qwen3Guard-Gen-0.6B" \
+PRESERVE_FILE="data/preservation/qwen2_5_0_5b/preserve_contexts.parquet" \
+PROJECTORS_PATH="<new-projector-artifact>" \
 GRPO_GENERATIONS=4 \
 ROLLOUT_TEMPERATURE=1.0 \
 ROLLOUT_TOP_P=0.98 \
@@ -296,11 +355,20 @@ EVAL_STEPS=50 \
 EVAL_OUTPUT_FILE="checkpoints/grit_qwen2_5_0_5b/fixed_eval.jsonl" \
 NPROC_PER_NODE=1 \
 bash scripts/run_kaggle_grit_train.sh \
+  --model-revision <base_revision-from-generation-manifest> \
+  --max-preserve-length 2304 \
   --lr 5e-7 \
   --alpha 1e-3 \
   --lambda-pres 0.1 \
   --epsilon-pres 1e-3
 ```
+
+The generated context and projector must come from the same preservation corpus,
+and the policy/base revision must match the generation manifest. A 2,304-token
+preservation budget can use substantially more memory than the 256-token legacy
+smoke path. To exercise compatibility instead, explicitly set `PRESERVE_FILE` to
+the legacy `data/grit_qwen2_5_0_5b/preserve_1000.parquet` artifact and use its
+matching projectors.
 
 Enable Phase 4 only as an explicit ablation:
 
@@ -372,6 +440,7 @@ Run local checks:
 
 ```bash
 /Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_projection.py
+/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_preservation_data.py
 /Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_predictor_restore.py
 /Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_trust_region_preservation.py
 /Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_total_update.py
