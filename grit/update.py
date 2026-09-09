@@ -46,7 +46,7 @@ class GritUpdateConfig:
     learning_rate: float = 1e-6
     lambda_pres: float = 1.0
     use_curvature: bool = False
-    curvature_mode: str = "exact_hvp"
+    curvature_mode: str = "sam_fd"
     sam_rho: float = 0.05
     sam_normalize_direction: bool = True
     hvp_last_linear_layers: int = 0
@@ -294,9 +294,9 @@ def assemble_grit_update(
         )
     if resolved.lambda_pres < 0:
         raise ValueError(f"lambda_pres must be non-negative, got {resolved.lambda_pres}")
-    if resolved.curvature_mode not in {"exact_hvp", "sam_fd"}:
+    if resolved.curvature_mode != "sam_fd":
         raise ValueError(
-            "curvature_mode must be 'exact_hvp' or 'sam_fd', "
+            "curvature_mode must be 'sam_fd'; exact HVP is kept only for toy checks, "
             f"got {resolved.curvature_mode!r}"
         )
     if resolved.sam_rho <= 0:
@@ -314,11 +314,10 @@ def assemble_grit_update(
     if parameters is None:
         parameters = trainable_named_parameters(model, parameter_filter)
 
-    exact_hvp = resolved.use_curvature and resolved.curvature_mode == "exact_hvp"
     task_gradients = _autograd_gradient_map(
         task_loss,
         parameters,
-        retain_graph=exact_hvp,
+        retain_graph=False,
         create_graph=False,
         detach=True,
     )
@@ -368,7 +367,7 @@ def assemble_grit_update(
                 gradients=projected_task_gradients,
                 parameter_filter=parameter_filter,
                 module_filter=module_filter,
-                preserve_autograd_graph=exact_hvp,
+                preserve_autograd_graph=False,
             )
         )
         with predictor_context as predictor_info:
@@ -389,39 +388,24 @@ def assemble_grit_update(
             module_filter,
             resolved.hvp_last_linear_layers,
         )
-        if resolved.curvature_mode == "exact_hvp":
-            from grit.curvature import curvature_corrected_preservation_gradients
+        if task_loss_fn is None:
+            raise ValueError("task_loss_fn is required when SAM-FD curvature is enabled")
+        from grit.curvature import finite_difference_curvature_corrected_preservation_gradients
 
-            curvature_result = curvature_corrected_preservation_gradients(
-                model,
-                task_loss,
-                preservation_gradients,
-                projectors,
-                learning_rate=resolved.learning_rate,
-                parameters=parameters,
-                hvp_parameters=hvp_parameters,
-                module_filter=module_filter,
-                missing_projector=resolved.missing_projector,
-            )
-        else:
-            if task_loss_fn is None:
-                raise ValueError("task_loss_fn is required for curvature_mode='sam_fd'")
-            from grit.curvature import finite_difference_curvature_corrected_preservation_gradients
-
-            curvature_result = finite_difference_curvature_corrected_preservation_gradients(
-                model,
-                task_loss_fn,
-                task_gradients,
-                preservation_gradients,
-                projectors,
-                learning_rate=resolved.learning_rate,
-                rho=resolved.sam_rho,
-                normalize_direction=resolved.sam_normalize_direction,
-                parameters=parameters,
-                hvp_parameters=hvp_parameters,
-                module_filter=module_filter,
-                missing_projector=resolved.missing_projector,
-            )
+        curvature_result = finite_difference_curvature_corrected_preservation_gradients(
+            model,
+            task_loss_fn,
+            task_gradients,
+            preservation_gradients,
+            projectors,
+            learning_rate=resolved.learning_rate,
+            rho=resolved.sam_rho,
+            normalize_direction=resolved.sam_normalize_direction,
+            parameters=parameters,
+            hvp_parameters=hvp_parameters,
+            module_filter=module_filter,
+            missing_projector=resolved.missing_projector,
+        )
         preservation_correction = curvature_result.gradients
     else:
         hvp_parameters = []
@@ -443,7 +427,6 @@ def assemble_grit_update(
         "grit/learning_rate": float(resolved.learning_rate),
         "grit/lambda_pres": float(resolved.lambda_pres),
         "grit/use_curvature": float(resolved.use_curvature),
-        "grit/curvature_mode_exact_hvp": float(resolved.curvature_mode == "exact_hvp"),
         "grit/curvature_mode_sam_fd": float(resolved.curvature_mode == "sam_fd"),
         "grit/sam_rho": float(resolved.sam_rho),
         "grit/sam_normalize_direction": float(resolved.sam_normalize_direction),

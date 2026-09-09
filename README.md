@@ -136,10 +136,10 @@ Run the actor integration check:
   verl/tests/experimental/grit/test_phase3_preservation_actor_on_cpu.py -q
 ```
 
-## Phase 4: Curvature HVP
+## Phase 4: SAM-FD Curvature
 
-Phase 4 implements the optional exact curvature correction from the unrolled
-GRIT objective:
+Phase 4 implements the optional curvature correction from the unrolled GRIT
+objective using SAM-style finite difference in training:
 
 ```text
 v - lr * H_task(theta) P v
@@ -148,10 +148,10 @@ v - lr * H_task(theta) P v
 where `v = grad_{theta_tilde} L_pres(theta_tilde)` and `P` is a full-theta
 block operator: protected Linear weights use the per-layer null-space
 projectors from Phase 1, while parameters without a projector use identity.
-The HVP uses the Pearlmutter identity
-`H u = grad_theta <grad_theta task_loss, u>` and skips the curvature path when
-the projected vector is zero. If the training code minimizes
-`task_loss = -J_task`, the HVP follows that minimization-loss sign.
+The SAM-FD approximation skips the curvature path when the projected vector is
+zero. If the training code minimizes `task_loss = -J_task`, the approximation
+follows that minimization-loss sign. The exact autograd HVP helper remains only
+for toy correctness checks.
 
 Run the toy HVP check:
 

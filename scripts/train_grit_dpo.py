@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--offload-safety-model",
         action="store_true",
-        help="Move the safety model to CPU between reward/eval calls to free VRAM for curvature HVP.",
+        help="Move the safety model to CPU between reward/eval calls to free VRAM for SAM-FD curvature.",
     )
     parser.add_argument("--debug-safety-samples", type=int, default=0)
     parser.add_argument("--eval-steps", type=int, default=0, help="Run fixed safety eval every N steps; 0 disables.")
@@ -110,16 +110,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--missing-projector", choices=["identity", "zero"], default="identity")
     parser.add_argument("--use-curvature", action="store_true")
     parser.add_argument(
-        "--curvature-mode",
-        choices=["exact_hvp", "sam_fd"],
-        default="exact_hvp",
-        help="Phase 4 curvature backend: exact autograd HVP or SAM-style finite difference.",
-    )
-    parser.add_argument(
         "--sam-rho",
         type=float,
         default=0.05,
-        help="SAM finite-difference perturbation radius for --curvature-mode sam_fd.",
+        help="SAM finite-difference perturbation radius used when --use-curvature is enabled.",
     )
     parser.add_argument(
         "--sam-no-normalize-direction",
@@ -127,10 +121,17 @@ def parse_args() -> argparse.Namespace:
         help="Use rho * P v directly for SAM-FD instead of rho * P v / ||P v||.",
     )
     parser.add_argument(
-        "--hvp-last-linear-layers",
+        "--curvature-last-linear-layers",
+        dest="hvp_last_linear_layers",
         type=int,
         default=0,
-        help="If >0, apply Phase 4 HVP only to the last N protected Linear weights; 0 uses all.",
+        help="If >0, apply SAM-FD curvature only to the last N protected Linear weights; 0 uses all.",
+    )
+    parser.add_argument(
+        "--hvp-last-linear-layers",
+        dest="hvp_last_linear_layers",
+        type=int,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--log-steps", type=int, default=1)
@@ -696,16 +697,10 @@ def parameters_are_finite(model: torch.nn.Module) -> bool:
 
 
 def configure_attention_for_curvature(args: argparse.Namespace) -> str | None:
-    exact_hvp = args.use_curvature and args.curvature_mode == "exact_hvp"
     if args.attn_implementation == "auto":
-        attn_implementation = "eager" if exact_hvp else None
+        attn_implementation = None
     else:
         attn_implementation = args.attn_implementation
-
-    if exact_hvp and torch.cuda.is_available():
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
     return attn_implementation
 
 
@@ -920,7 +915,7 @@ def main() -> None:
         model_kwargs["attn_implementation"] = attn_implementation
     if main_process and args.use_curvature:
         print(
-            f"curvature mode: {args.curvature_mode} "
+            "curvature mode: sam_fd "
             f"attention implementation: {attn_implementation or 'auto'}",
             flush=True,
         )
@@ -1237,7 +1232,7 @@ def main() -> None:
                 learning_rate=args.lr,
                 lambda_pres=args.lambda_pres,
                 use_curvature=args.use_curvature,
-                curvature_mode=args.curvature_mode,
+                curvature_mode="sam_fd",
                 sam_rho=args.sam_rho,
                 sam_normalize_direction=not args.sam_no_normalize_direction,
                 hvp_last_linear_layers=args.hvp_last_linear_layers,
@@ -1289,7 +1284,6 @@ def main() -> None:
             "proj_grad": result.metrics["grit/projected_task_grad_norm"],
             "hvp_skipped": result.metrics.get("grit/hvp_skipped", 1.0),
             "hvp_parameter_count": result.metrics.get("grit/hvp_parameter_count", 0.0),
-            "curvature_mode_sam_fd": result.metrics.get("grit/curvature_mode_sam_fd", 0.0),
             "sam_rho": result.metrics.get("grit/sam_rho", 0.0),
             "projected_vector_norm": result.metrics.get("grit/projected_vector_norm", 0.0),
             "hvp_norm": result.metrics.get("grit/hvp_norm", 0.0),
@@ -1321,7 +1315,7 @@ def main() -> None:
                 hvp=f"{last_metrics['hvp_norm']:.2e}",
                 hvp_n=f"{last_metrics['hvp_parameter_count']:.0f}",
                 hvp_skip=f"{last_metrics['hvp_skipped']:.0f}",
-                curv="sam" if last_metrics.get("curvature_mode_sam_fd", 0.0) else "hvp",
+                curv="sam" if args.use_curvature else "off",
                 reward=f"{last_metrics.get('reward_mean', 0.0):.3f}",
                 reward_avg=f"{last_metrics.get('run_reward_mean', 0.0):.3f}",
                 unsafe=f"{last_metrics.get('unsafe_fraction', 0.0):.2f}",

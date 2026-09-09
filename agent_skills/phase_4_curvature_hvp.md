@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add optional curvature, using either exact HVP or SAM-style finite difference:
+Add optional curvature with SAM-style finite difference:
 
 ```text
 v - lr * H P v
@@ -43,7 +43,7 @@ Before moving on:
 manual HVP matches finite difference on a toy model
 SAM-FD approximates exact HVP on a toy model
 curvature path is skipped when v == 0
-create_graph=True is only used for exact HVP, not SAM-FD
+training curvature does not expose exact HVP as a backend
 ```
 
 ## Debug Notes
@@ -65,5 +65,5 @@ hvp = torch.autograd.grad(dot, params)
 ```
 
 - Do not build the full Hessian matrix.
-- Prefer `curvature_mode=sam_fd` for memory-constrained real-model tests.
+- Exact HVP is kept only as a toy reference check; training uses SAM-FD.
 - Watch signs: if code minimizes `task_loss = -J_task`, document whether `H` belongs to `J_task` or `task_loss`.

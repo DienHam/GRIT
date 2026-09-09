@@ -269,17 +269,15 @@ H_task u = grad_theta <grad_theta L_task(theta), u>
 u = P v
 ```
 
-Do not build a full Hessian. Use HVP only when `--use-curvature` is enabled.
-Curvature backends:
+Do not build a full Hessian. When `--use-curvature` is enabled, the training
+workflow uses SAM-style finite difference only:
 
 ```text
-exact_hvp   autograd Hessian-vector product
-sam_fd      SAM-style finite difference:
-            H_task u ~= (grad_task(theta + rho * u / ||u||) - grad_task(theta)) * ||u|| / rho
+H_task u ~= (grad_task(theta + rho * u / ||u||) - grad_task(theta)) * ||u|| / rho
 ```
 
-On T4, exact HVP is much heavier than first-order GRIT. `sam_fd` avoids
-second-order autograd but costs one extra task-loss forward/backward.
+The exact autograd HVP helper is kept only for toy correctness checks. Real
+training does not expose an exact-HVP backend.
 
 Main files:
 
@@ -389,17 +387,19 @@ smoke path. To exercise compatibility instead, explicitly set `PRESERVE_FILE` to
 the legacy `data/grit_qwen2_5_0_5b/preserve_1000.parquet` artifact and use its
 matching projectors.
 
-Enable Phase 4 only as an explicit ablation:
+The standard curvature workflow uses SAM-FD. Run it with the task batch size
+and preservation batch size stated explicitly:
 
 ```bash
-bash scripts/run_kaggle_grit_train.sh --use-curvature
+CURVATURE_BACKEND=sam_fd \
+SAM_RHO=0.05 \
+bash scripts/run_kaggle_grit_train.sh \
+  --use-curvature \
+  --task-batch-size 16 \
+  --preserve-batch-size 1
 ```
 
-Use SAM finite-difference curvature to avoid exact second-order HVP:
-
-```bash
-CURVATURE_MODE=sam_fd SAM_RHO=0.05 bash scripts/run_kaggle_grit_train.sh --use-curvature
-```
+`SAM_RHO=0.05` controls the finite-difference perturbation radius.
 
 Use very small settings for Phase 4 smoke on T4:
 
@@ -419,9 +419,9 @@ task                current batch task loss
 pres                current batch preservation loss
 kl                  current batch preservation violation fraction
 grad                current final gradient norm
-hvp                 exact or SAM-FD HVP approximation norm, zero when curvature is disabled
+hvp                 SAM-FD HVP approximation norm, zero when curvature is disabled
 hvp_skip            1 when HVP is skipped
-curv                curvature backend shown in tqdm: hvp or sam
+curv                curvature backend shown in tqdm: sam or off
 ```
 
 Run-average metrics:

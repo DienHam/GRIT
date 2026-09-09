@@ -45,8 +45,7 @@ Before calling the implementation complete:
 ```text
 can run gradient-projection-only ablation
 can run first-order GRIT
-can toggle curvature
-can choose exact_hvp or sam_fd curvature
+can toggle SAM-FD curvature
 logs projection rank/nullity and KL violation fraction
 logs preservation loss and whether HVP was skipped
 logs task AdamW delta projection removal

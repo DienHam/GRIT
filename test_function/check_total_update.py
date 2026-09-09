@@ -45,8 +45,11 @@ def make_losses(
     responses: torch.Tensor,
     response_mask: torch.Tensor,
 ):
-    task_logits = model(task_x)
-    task_loss = 0.5 * (task_logits - task_target).square().mean()
+    def task_loss_fn():
+        task_logits = model(task_x)
+        return 0.5 * (task_logits - task_target).square().mean()
+
+    task_loss = task_loss_fn()
 
     def preservation_loss_fn():
         policy_logits = model(pres_x)
@@ -62,7 +65,7 @@ def make_losses(
             default_probability=1e-6,
         )
 
-    return task_loss, preservation_loss_fn
+    return task_loss, task_loss_fn, preservation_loss_fn
 
 
 def run_update(
@@ -80,7 +83,7 @@ def run_update(
     response_mask = torch.tensor(
         [[True, True], [True, False], [True, True], [False, True]]
     )
-    task_loss, preservation_loss_fn = make_losses(
+    task_loss, task_loss_fn, preservation_loss_fn = make_losses(
         model,
         base_model,
         task_x,
@@ -94,6 +97,7 @@ def run_update(
         task_loss,
         preservation_loss_fn,
         projectors,
+        task_loss_fn=task_loss_fn,
         config=GritUpdateConfig(
             learning_rate=0.2,
             lambda_pres=lambda_pres,
