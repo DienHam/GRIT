@@ -20,6 +20,13 @@ D_task prompt
 
 Current smoke target:
 
+The explicit NSPO-domain preservation preparation is documented in
+[`docs/preservation_data.md`](docs/preservation_data.md). It samples AlpacaFarm,
+GSM8K and LeetCodeDataset, then optionally generates frozen-base response contexts.
+Use its generated context artifact and rebuilt projectors for response-level KL.
+The legacy task preparation below still defaults to PKU-SafeRLHF preservation
+unless a separate preservation source is supplied.
+
 ```text
 Task dataset:      PKU-Alignment/PKU-SafeRLHF, 11K task prompts
 Preserve dataset:  1,000 prompts in data/grit_qwen2_5_0_5b/preserve_1000.parquet

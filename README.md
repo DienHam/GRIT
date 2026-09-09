@@ -5,6 +5,9 @@ Start from `WORKFLOW.md` when running or modifying the repo. It is the compact
 map of the current artifact flow, phase contracts, training commands, metrics,
 and Google Drive sync expectations.
 
+For the AlpacaFarm/GSM8K/LeetCodeDataset preservation mixture, see
+[preservation data preparation](docs/preservation_data.md).
+
 ## Phase 1: Null-Space Gradient Projection
 
 Phase 1 implements the NSPO-theory gradient projection primitive:
