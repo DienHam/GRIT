@@ -3,7 +3,7 @@
 GRIT evaluates preservation behavior at the point the model is about to occupy
 after the projected task update:
 
-    theta_tilde = theta - alpha * projected_grad
+    theta_tilde = theta - learning_rate * projected_grad
 
 This module applies that update in-place under ``torch.no_grad()``, stores only
 the deltas, and restores the original parameters when the context exits.
@@ -66,7 +66,7 @@ def linear_weight_parameter_names(
 def temporary_predictor_step(
     model: nn.Module,
     *,
-    alpha: float,
+    learning_rate: float,
     gradients: GradientMap | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
@@ -76,7 +76,8 @@ def temporary_predictor_step(
 
     Args:
         model: Model whose parameters should be temporarily updated.
-        alpha: Predictor step size. The temporary delta is ``-alpha * grad``.
+        learning_rate: The single GRIT step size. The temporary delta is
+            ``-learning_rate * grad``.
         gradients: Optional mapping from parameter name to projected gradient.
             If omitted, each selected parameter's current ``.grad`` is used.
         parameter_filter: Optional predicate to restrict updated parameters. If
@@ -97,8 +98,8 @@ def temporary_predictor_step(
         gradients. It intentionally stores deltas rather than a full model copy.
     """
 
-    if alpha < 0:
-        raise ValueError(f"alpha must be non-negative, got {alpha}")
+    if learning_rate < 0:
+        raise ValueError(f"learning_rate must be non-negative, got {learning_rate}")
 
     if parameter_filter is None:
         linear_weight_names = linear_weight_parameter_names(model, module_filter)
@@ -124,7 +125,9 @@ def temporary_predictor_step(
                     f"expected {tuple(parameter.shape)}"
                 )
 
-            delta = grad.detach().to(device=parameter.device, dtype=parameter.dtype).mul(-alpha)
+            delta = grad.detach().to(device=parameter.device, dtype=parameter.dtype).mul(
+                -learning_rate
+            )
             if preserve_autograd_graph:
                 parameter.data.add_(delta)
             else:
@@ -152,11 +155,67 @@ def temporary_predictor_step(
                     parameter.sub_(delta)
 
 
+@contextmanager
+def temporary_predictor_direction_step(
+    model: nn.Module,
+    *,
+    learning_rate: float,
+    directions: GradientMap,
+    parameter_filter: ParameterFilter | None = None,
+    module_filter: ModuleFilter | None = None,
+) -> Iterator[PredictorStepInfo]:
+    """Temporarily apply signed optimizer directions and restore on exit.
+
+    The temporary point is ``theta + learning_rate * direction``.
+    """
+
+    if learning_rate < 0:
+        raise ValueError(f"learning_rate must be non-negative, got {learning_rate}")
+
+    applied: list[tuple[nn.Parameter, torch.Tensor]] = []
+    squared_update_norm = 0.0
+    max_update_abs = 0.0
+
+    with torch.no_grad():
+        for name, parameter in _iter_trainable_parameters(model, parameter_filter):
+            direction = directions.get(name)
+            if direction is None:
+                continue
+            if direction.shape != parameter.shape:
+                raise ValueError(
+                    f"direction for {name} has shape {tuple(direction.shape)}, "
+                    f"expected {tuple(parameter.shape)}"
+                )
+
+            update = direction.detach().to(
+                device=parameter.device, dtype=parameter.dtype
+            ).mul(learning_rate)
+            parameter.add_(update)
+            applied.append((parameter, update))
+
+            update_float = update.float()
+            squared_update_norm += float(update_float.square().sum().item())
+            max_update_abs = max(max_update_abs, float(update_float.abs().max().item()))
+
+    info = PredictorStepInfo(
+        updated_parameters=len(applied),
+        update_norm=squared_update_norm**0.5,
+        max_update_abs=max_update_abs,
+    )
+
+    try:
+        yield info
+    finally:
+        with torch.no_grad():
+            for parameter, update in reversed(applied):
+                parameter.sub_(update)
+
+
 def forward_with_predictor_step(
     model: nn.Module,
     batch: Mapping[str, torch.Tensor],
     *,
-    alpha: float,
+    learning_rate: float,
     gradients: GradientMap | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
@@ -166,7 +225,7 @@ def forward_with_predictor_step(
 
     with temporary_predictor_step(
         model,
-        alpha=alpha,
+        learning_rate=learning_rate,
         gradients=gradients,
         parameter_filter=parameter_filter,
         module_filter=module_filter,

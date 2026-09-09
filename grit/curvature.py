@@ -1,12 +1,13 @@
 """Curvature HVP utilities for GRIT Phase 4.
 
-GRIT's exact preservation gradient augments the first-order preservation pull
+GRIT's exact preservation gradient corrects the first-order preservation pull
 
     v = grad_{theta_tilde} L_pres(theta_tilde)
 
-with a Hessian-vector product through the projected task direction:
+with the Hessian-vector product from differentiating through the task descent
+predictor step:
 
-    v + alpha * H_task(theta) P v
+    v - learning_rate * H_task(theta) P v
 
 This module computes the product without materializing a Hessian.
 """
@@ -209,14 +210,14 @@ def curvature_corrected_preservation_gradients(
     preservation_gradients: GradientMap,
     projectors: Mapping[str, torch.Tensor | ProjectorBuildResult],
     *,
-    alpha: float,
+    learning_rate: float,
     parameters: Sequence[NamedParameter] | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
     hvp_parameters: Sequence[NamedParameter] | None = None,
     missing_projector: str = "identity",
 ) -> CurvatureCorrectionResult:
-    """Return ``v + alpha * H_task P v`` as named gradients.
+    """Return ``v - learning_rate * H_task P v`` as named gradients.
 
     ``P`` is treated as a full-theta block operator: protected Linear weights
     use their Phase 1 projector, and parameters without a projector use the
@@ -225,8 +226,8 @@ def curvature_corrected_preservation_gradients(
     HVP is the Hessian of that minimization loss, not the Hessian of ``J_task``.
     """
 
-    if alpha < 0:
-        raise ValueError(f"alpha must be non-negative, got {alpha}")
+    if learning_rate < 0:
+        raise ValueError(f"learning_rate must be non-negative, got {learning_rate}")
     if parameters is None:
         parameters = trainable_named_parameters(model, parameter_filter)
 
@@ -261,7 +262,7 @@ def curvature_corrected_preservation_gradients(
         if name in projected_vector
     }
 
-    skipped_hvp = alpha == 0.0 or not hvp_parameters or _is_all_zero(hvp_projected_vector.values())
+    skipped_hvp = learning_rate == 0.0 or not hvp_parameters or _is_all_zero(hvp_projected_vector.values())
     if skipped_hvp:
         hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
     else:
@@ -270,7 +271,7 @@ def curvature_corrected_preservation_gradients(
         hvp.update(partial_hvp)
 
     gradients = {
-        name: first_order[name] + hvp[name].to(first_order[name]).mul(alpha)
+        name: first_order[name] - hvp[name].to(first_order[name]).mul(learning_rate)
         for name, _parameter in parameters
     }
     preservation_grad_norm = _squared_norm(first_order.values()) ** 0.5
@@ -284,5 +285,128 @@ def curvature_corrected_preservation_gradients(
         skipped_hvp=skipped_hvp,
         preservation_grad_norm=preservation_grad_norm,
         projected_vector_norm=projected_vector_norm,
+        hvp_norm=hvp_norm,
+    )
+
+
+def finite_difference_curvature_corrected_preservation_gradients(
+    model: nn.Module,
+    task_loss_fn: Callable[[], torch.Tensor],
+    task_gradients: GradientMap,
+    preservation_gradients: GradientMap,
+    projectors: Mapping[str, torch.Tensor | ProjectorBuildResult],
+    *,
+    learning_rate: float,
+    rho: float,
+    normalize_direction: bool = True,
+    parameters: Sequence[NamedParameter] | None = None,
+    parameter_filter: ParameterFilter | None = None,
+    module_filter: ModuleFilter | None = None,
+    hvp_parameters: Sequence[NamedParameter] | None = None,
+    missing_projector: str = "identity",
+) -> CurvatureCorrectionResult:
+    """Approximate ``v - learning_rate * H_task P v`` with a SAM-style finite difference.
+
+    The perturbation direction is ``P v``. With ``normalize_direction=True`` the
+    model is perturbed by ``rho * P v / ||P v||`` and the finite difference is
+    rescaled to approximate ``H_task P v`` rather than ``H_task normalize(P v)``.
+    """
+
+    if learning_rate < 0:
+        raise ValueError(f"learning_rate must be non-negative, got {learning_rate}")
+    if rho <= 0:
+        raise ValueError(f"rho must be positive, got {rho}")
+    if parameters is None:
+        parameters = trainable_named_parameters(model, parameter_filter)
+
+    first_order: dict[str, torch.Tensor] = {}
+    for name, parameter in parameters:
+        grad = preservation_gradients.get(name)
+        if grad is None:
+            first_order[name] = _zero_like_parameter(parameter)
+            continue
+        if grad.shape != parameter.shape:
+            raise ValueError(
+                f"preservation gradient for {name} has shape {tuple(grad.shape)}, "
+                f"expected {tuple(parameter.shape)}"
+            )
+        first_order[name] = grad.detach().clone()
+
+    projected_vector = project_vector_with_module_projectors(
+        model,
+        first_order,
+        projectors,
+        parameters=parameters,
+        module_filter=module_filter,
+        missing=missing_projector,
+    )
+
+    if hvp_parameters is None:
+        hvp_parameters = parameters
+    hvp_parameter_names = {name for name, _parameter in hvp_parameters}
+    hvp_projected_vector = {
+        name: projected_vector[name]
+        for name in hvp_parameter_names
+        if name in projected_vector
+    }
+
+    projected_vector_norm = _squared_norm(hvp_projected_vector.values()) ** 0.5
+    skipped_hvp = learning_rate == 0.0 or not hvp_parameters or projected_vector_norm == 0.0
+    if skipped_hvp:
+        hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
+    else:
+        scale = (rho / projected_vector_norm) if normalize_direction else rho
+        restore: list[tuple[nn.Parameter, torch.Tensor]] = []
+        with torch.no_grad():
+            for name, parameter in hvp_parameters:
+                direction = hvp_projected_vector[name].to(device=parameter.device, dtype=parameter.dtype)
+                perturbation = direction.mul(scale)
+                parameter.add_(perturbation)
+                restore.append((parameter, perturbation.detach().clone()))
+        try:
+            perturbed_loss = task_loss_fn()
+            perturbed_partial = torch.autograd.grad(
+                perturbed_loss,
+                [parameter for _, parameter in hvp_parameters],
+                retain_graph=False,
+                allow_unused=True,
+            )
+        finally:
+            with torch.no_grad():
+                for parameter, perturbation in restore:
+                    parameter.sub_(perturbation)
+
+        base_scale = (projected_vector_norm / rho) if normalize_direction else (1.0 / rho)
+        base_gradients = task_gradients
+        partial_hvp: dict[str, torch.Tensor] = {}
+        for (name, parameter), perturbed_grad in zip(hvp_parameters, perturbed_partial, strict=True):
+            if perturbed_grad is None:
+                partial_hvp[name] = _zero_like_parameter(parameter)
+                continue
+            base_grad = base_gradients.get(name)
+            if base_grad is None:
+                base_grad = _zero_like_parameter(parameter)
+            partial_hvp[name] = (
+                perturbed_grad.detach() - base_grad.detach().to(perturbed_grad)
+            ).mul(base_scale)
+
+        hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
+        hvp.update(partial_hvp)
+
+    gradients = {
+        name: first_order[name] - hvp[name].to(first_order[name]).mul(learning_rate)
+        for name, _parameter in parameters
+    }
+    preservation_grad_norm = _squared_norm(first_order.values()) ** 0.5
+    full_projected_vector_norm = _squared_norm(projected_vector.values()) ** 0.5
+    hvp_norm = _squared_norm(hvp.values()) ** 0.5
+
+    return CurvatureCorrectionResult(
+        gradients=gradients,
+        projected_vector=projected_vector,
+        hvp=hvp,
+        skipped_hvp=skipped_hvp,
+        preservation_grad_norm=preservation_grad_norm,
+        projected_vector_norm=full_projected_vector_norm,
         hvp_norm=hvp_norm,
     )

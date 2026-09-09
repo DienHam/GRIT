@@ -188,9 +188,6 @@ grit:
   # Text column in the preservation dataset
   preserve_text_column: text
 
-  # Predictor step size for theta_tilde = theta - alpha * projected_gradient
-  alpha: 0.01
-
   # Preservation gradient coefficient
   lambda_pres: 1.0
 

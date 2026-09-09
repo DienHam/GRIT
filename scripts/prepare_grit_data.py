@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare task and preservation parquet files for a first GRIT run.
+"""Prepare task and NSPO-style preservation parquet files for GRIT.
 
 The task set is built from PKU-SafeRLHF preference/safety labels. The
-preservation set is a 1,000-sample prompt/text pool used by Phase 1 projector
-building and Phase 3 trust-region anchoring.
+default preservation set is a 1,000-prompt mixture of general instruction,
+math, and code data used by Phase 1 and Phase 3.
 """
 
 from __future__ import annotations
@@ -25,6 +25,16 @@ PROMPT_BEGIN = "BEGINNING OF CONVERSATION: "
 PROMPT_USER = "USER: {input} "
 PROMPT_ASSISTANT = "ASSISTANT:"
 
+NSPO_ALPACA_DATA_FILE = (
+    "hf://datasets/tatsu-lab/alpaca_farm/"
+    "alpaca_instructions/unlabeled.json"
+)
+NSPO_PRESERVE_SOURCES = (
+    ("common_sense", "tatsu-lab/alpaca_farm", "alpaca_instructions/unlabeled"),
+    ("code", "newfacade/LeetCodeDataset", "train"),
+    ("math", "openai/gsm8k", "main/train"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -36,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preserve-split", default="train")
     parser.add_argument("--preserve-text-column", default=None)
     parser.add_argument("--preserve-max-samples", type=int, default=1000)
+    parser.add_argument(
+        "--preserve-only",
+        action="store_true",
+        help="Only rebuild preserve_1000.parquet; leave task parquet files unchanged.",
+    )
     parser.add_argument("--prefer-safe", action="store_true", default=True)
     parser.add_argument("--prefer-helpful", dest="prefer_safe", action="store_false")
     parser.add_argument("--seed", type=int, default=66)
@@ -95,7 +110,7 @@ def infer_text_column(dataset, requested: str | None) -> str:
     )
 
 
-def load_any_dataset(dataset_path: str, split: str):
+def load_any_dataset(dataset_path: str, split: str, config: str | None = None):
     from datasets import load_dataset
 
     path = Path(dataset_path)
@@ -105,7 +120,102 @@ def load_any_dataset(dataset_path: str, split: str):
         return load_dataset("json", data_files=str(path), split=split)
     if path.suffix == ".csv":
         return load_dataset("csv", data_files=str(path), split=split)
-    return load_dataset(dataset_path, split=split)
+    return load_dataset(dataset_path, config, split=split)
+
+
+def _alpaca_prompt(row: dict[str, Any]) -> str:
+    instruction = str(row["instruction"]).strip()
+    context = str(row.get("input", "")).strip()
+    return instruction if not context else f"{instruction}\n\n{context}"
+
+
+def _required_prompt(row: dict[str, Any], column: str) -> str:
+    text = str(row[column]).strip()
+    if not text:
+        raise ValueError(f"Empty {column!r} prompt in NSPO preservation source")
+    return text
+
+
+def load_nspo_preserve_sources() -> list[tuple[str, str, Any]]:
+    from datasets import load_dataset
+
+    # AlpacaFarm still uses a dataset script that recent datasets versions no
+    # longer execute, so load its official unlabeled JSON artifact directly.
+    common_sense = load_dataset(
+        "json", data_files=NSPO_ALPACA_DATA_FILE, split="train"
+    )
+    code = load_dataset("newfacade/LeetCodeDataset", split="train")
+    math = load_dataset("openai/gsm8k", "main", split="train")
+    return [
+        ("common_sense", "tatsu-lab/alpaca_farm", common_sense),
+        ("code", "newfacade/LeetCodeDataset", code),
+        ("math", "openai/gsm8k", math),
+    ]
+
+
+def build_nspo_preserve_rows(
+    sources: list[tuple[str, str, Any]], *, max_samples: int, seed: int
+) -> list[dict[str, str]]:
+    if max_samples <= 0:
+        return []
+
+    base_quota, remainder = divmod(max_samples, len(sources))
+    rows: list[dict[str, str]] = []
+    rng = random.Random(seed)
+    for source_index, (domain, dataset_name, dataset) in enumerate(sources):
+        quota = base_quota + int(source_index < remainder)
+        indices = list(range(len(dataset)))
+        rng.shuffle(indices)
+        if len(indices) < quota:
+            raise ValueError(
+                f"NSPO preservation source {dataset_name} has {len(indices)} rows, "
+                f"but quota is {quota}"
+            )
+
+        for index in indices[:quota]:
+            row = dataset[index]
+            if domain == "common_sense":
+                raw_text = _alpaca_prompt(row)
+            elif domain == "code":
+                raw_text = _required_prompt(row, "query")
+            else:
+                raw_text = _required_prompt(row, "question")
+            rows.append(
+                {
+                    "data_source": dataset_name,
+                    "domain": domain,
+                    "text": format_prompt(raw_text),
+                    "raw_text": raw_text,
+                }
+            )
+
+    rng.shuffle(rows)
+    return rows
+
+
+def build_custom_preserve_rows(args: argparse.Namespace) -> list[dict[str, str]]:
+    preserve_raw = load_any_dataset(args.preserve_dataset, args.preserve_split)
+    text_column = infer_text_column(preserve_raw, args.preserve_text_column)
+    preserve_indices = list(range(len(preserve_raw)))
+    random.Random(args.seed).shuffle(preserve_indices)
+    preserve_rows = []
+    with tqdm(total=args.preserve_max_samples, desc="[4/4] Sampling preserve rows") as progress:
+        for index in preserve_indices:
+            text = str(preserve_raw[index][text_column]).strip()
+            if not text:
+                continue
+            preserve_rows.append(
+                {
+                    "data_source": args.preserve_dataset,
+                    "domain": "custom",
+                    "text": format_prompt(text),
+                    "raw_text": text,
+                }
+            )
+            progress.update(1)
+            if len(preserve_rows) >= args.preserve_max_samples:
+                break
+    return preserve_rows
 
 
 def main() -> None:
@@ -117,55 +227,50 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/4] Loading task dataset: {args.task_dataset}", flush=True)
-    task_raw = load_any_dataset(args.task_dataset, args.task_split)
-    task_indices = list(range(len(task_raw)))
-    random.shuffle(task_indices)
-    total_task = min(args.task_max_samples + args.val_size, len(task_indices))
-    task_rows = [
-        row_to_task(task_raw[index], prefer_safe=args.prefer_safe)
-        for index in tqdm(task_indices[:total_task], desc="[2/4] Formatting task rows")
-    ]
-    train_rows = task_rows[: args.task_max_samples]
-    val_rows = task_rows[args.task_max_samples :]
-
     train_path = output_dir / "task_train.parquet"
     val_path = output_dir / "task_val.parquet"
-    print(f"[3/4] Writing task parquet files to {output_dir}", flush=True)
-    Dataset.from_list(train_rows).to_parquet(str(train_path))
-    Dataset.from_list(val_rows).to_parquet(str(val_path))
+    if not args.preserve_only:
+        print(f"[1/4] Loading task dataset: {args.task_dataset}", flush=True)
+        task_raw = load_any_dataset(args.task_dataset, args.task_split)
+        task_indices = list(range(len(task_raw)))
+        random.shuffle(task_indices)
+        total_task = min(args.task_max_samples + args.val_size, len(task_indices))
+        task_rows = [
+            row_to_task(task_raw[index], prefer_safe=args.prefer_safe)
+            for index in tqdm(task_indices[:total_task], desc="[2/4] Formatting task rows")
+        ]
+        train_rows = task_rows[: args.task_max_samples]
+        val_rows = task_rows[args.task_max_samples :]
 
-    preserve_dataset_name = args.preserve_dataset or args.task_dataset
-    print(f"[4/4] Loading preservation dataset: {preserve_dataset_name}", flush=True)
-    preserve_raw = load_any_dataset(preserve_dataset_name, args.preserve_split)
-    text_column = infer_text_column(preserve_raw, args.preserve_text_column)
-    preserve_indices = list(range(len(preserve_raw)))
-    random.shuffle(preserve_indices)
-    preserve_rows = []
-    with tqdm(total=args.preserve_max_samples, desc="[4/4] Sampling preserve rows") as progress:
-        for index in preserve_indices:
-            text = str(preserve_raw[index][text_column]).strip()
-            if not text:
-                continue
-            preserve_rows.append(
-                {
-                    "data_source": preserve_dataset_name,
-                    "text": format_prompt(text) if text_column == "prompt" else text,
-                    "raw_text": text,
-                }
-            )
-            progress.update(1)
-            if len(preserve_rows) >= args.preserve_max_samples:
-                break
+        print(f"[3/4] Writing task parquet files to {output_dir}", flush=True)
+        Dataset.from_list(train_rows).to_parquet(str(train_path))
+        Dataset.from_list(val_rows).to_parquet(str(val_path))
+        print(f"task_train={train_path} rows={len(train_rows)}")
+        print(f"task_val={val_path} rows={len(val_rows)}")
+
+    if args.preserve_dataset:
+        print(f"[4/4] Loading custom preservation dataset: {args.preserve_dataset}", flush=True)
+        preserve_rows = build_custom_preserve_rows(args)
+        preserve_source = args.preserve_dataset
+    else:
+        print("[4/4] Loading NSPO general-task preservation mixture", flush=True)
+        preserve_rows = build_nspo_preserve_rows(
+            load_nspo_preserve_sources(),
+            max_samples=args.preserve_max_samples,
+            seed=args.seed,
+        )
+        preserve_source = ",".join(source[1] for source in NSPO_PRESERVE_SOURCES)
 
     preserve_path = output_dir / "preserve_1000.parquet"
     Dataset.from_list(preserve_rows).to_parquet(str(preserve_path))
 
-    print(f"task_train={train_path} rows={len(train_rows)}")
-    print(f"task_val={val_path} rows={len(val_rows)}")
+    domain_counts = {
+        domain: sum(row["domain"] == domain for row in preserve_rows)
+        for domain in sorted({row["domain"] for row in preserve_rows})
+    }
     print(
         f"preserve={preserve_path} rows={len(preserve_rows)} "
-        f"source={preserve_dataset_name} text_column={text_column}"
+        f"sources={preserve_source} domains={domain_counts}"
     )
 
 

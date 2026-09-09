@@ -6,7 +6,7 @@ projectors:
   missing: identity
 
 update:
-  alpha: 1.0
+  learning_rate: 1.0e-6
   lambda_pres: 1.0
   use_curvature: false
 

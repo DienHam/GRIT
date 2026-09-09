@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-prompt-length", type=int, default=256)
     parser.add_argument("--max-response-length", type=int, default=128)
     parser.add_argument("--max-preserve-length", type=int, default=256)
-    parser.add_argument("--alpha", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lambda-pres", type=float, default=1.0)
     parser.add_argument("--epsilon-pres", type=float, default=0.05)
     parser.add_argument("--top-k", type=int, default=64)
@@ -234,7 +234,7 @@ def main() -> None:
         preservation_loss_fn,
         projectors,
         config=GritUpdateConfig(
-            alpha=args.alpha,
+            learning_rate=args.lr,
             lambda_pres=args.lambda_pres,
             use_curvature=args.use_curvature,
             missing_projector=args.missing_projector,

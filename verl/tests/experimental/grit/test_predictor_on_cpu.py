@@ -38,7 +38,9 @@ def test_temporary_predictor_restores_and_combines_gradients():
     projected_task_gradients = clone_current_gradients(model)
     original_parameters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
 
-    with temporary_predictor_step(model, alpha=0.2, gradients=projected_task_gradients) as predictor_info:
+    with temporary_predictor_step(
+        model, learning_rate=0.2, gradients=projected_task_gradients
+    ) as predictor_info:
         assert predictor_info.updated_parameters == len(projected_task_gradients)
         assert predictor_info.update_norm > 0.0
         predictor_parameters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
@@ -62,7 +64,7 @@ def test_temporary_predictor_restores_and_combines_gradients():
 
     for name, parameter in model.named_parameters():
         preservation_gradient = grad_after_preservation[name] - projected_task_gradients[name]
-        expected = projected_task_gradients[name] - lambda_pres * preservation_gradient
+        expected = projected_task_gradients[name] + lambda_pres * preservation_gradient
         torch.testing.assert_close(parameter.grad, expected)
 
     assert metrics["grit/projected_task_grad_norm"] > 0.0
@@ -82,7 +84,9 @@ def test_phase5_writes_explicit_final_gradient_after_separate_preservation_backw
     original_parameters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
 
     model.zero_grad(set_to_none=True)
-    with temporary_predictor_step(model, alpha=0.2, gradients=projected_task_gradients):
+    with temporary_predictor_step(
+        model, learning_rate=0.2, gradients=projected_task_gradients
+    ):
         preservation_loss = (model(x) - target).square().mean()
         preservation_loss.backward()
         preservation_gradients = clone_current_gradients(model)
@@ -101,7 +105,7 @@ def test_phase5_writes_explicit_final_gradient_after_separate_preservation_backw
     )
 
     for name, parameter in model.named_parameters():
-        expected = projected_task_gradients[name] - lambda_pres * preservation_gradients[name]
+        expected = projected_task_gradients[name] + lambda_pres * preservation_gradients[name]
         torch.testing.assert_close(parameter.grad, expected)
 
     assert metrics["grit/projected_task_grad_norm"] > 0.0

@@ -14,7 +14,7 @@ D_task prompt
 -> safety model reward
 -> clipped GRPO task gradient
 -> GRIT gradient projection and preservation correction
--> split AdamW-delta manual update
+-> one-LR manual GRIT update
 -> checkpoint and optional Hub push
 ```
 
@@ -68,6 +68,7 @@ They can be deleted at any time.
 ```mermaid
 flowchart TD
     A["PKU-SafeRLHF"] --> B["scripts/prepare_grit_data.py"]
+    A2["AlpacaFarm + LeetCodeDataset + GSM8K"] --> B
     B --> C["data/.../task_train.parquet"]
     B --> L["legacy text-only preserve_1000.parquet"]
     D["Pinned AlpacaFarm + GSM8K + LeetCodeDataset files"] --> E["prepare_preservation_data.py sample"]
@@ -159,25 +160,23 @@ Build projectors from preservation activations:
 P = U_null U_null^T
 ```
 
-The current training entrypoint uses split AdamW-delta projection. The task
-gradient is first converted into an AdamW-shaped delta, then only that task
-delta is projected for protected Linear weights:
+The current training entrypoint converts the task gradient into an AdamW-shaped
+direction without a learning rate, then projects only that direction for
+protected Linear weights:
 
 ```text
-delta_task <- AdamW_task(grad_task)
-term_task_W <- delta_task_W @ P
+direction_task <- AdamW_direction(grad_task)
+term_task_W <- direction_task_W @ P
 ```
 
-Preservation remains an unprojected correction with its own AdamW state:
+Preservation remains an unprojected raw correction with no optimizer state:
 
 ```text
-delta_pres <- AdamW_pres(preservation_correction)
-W <- W + alpha * term_task - lambda_pres * delta_pres
+W <- W + lr * (term_task - lambda_pres * correction)
 ```
 
-`AdamW_task` and `AdamW_pres` keep separate moment states. The training loop
-does not call a final `optimizer.step()` because the two additive deltas are
-applied manually.
+Only `AdamW_task` keeps moment state. The training loop does not call a final
+`optimizer.step()` because the two additive deltas are applied manually.
 
 Do not use NSPO's periodic weight repair as the primary GRIT mechanism:
 
@@ -197,10 +196,13 @@ verl/verl/workers/actor/dp_actor.py
 
 ### Phase 2: Predictor Theta Tilde
 
-Temporarily move to the point after the projected task step:
+Temporarily move to the point after the projected task step. In the current
+one-LR path this is the signed optimizer direction that will actually be applied:
 
 ```text
-theta_tilde = theta - alpha * projected_task_grad
+direction_task = AdamW_direction(grad_task)
+term_task = project(direction_task)
+theta_tilde = theta + lr * term_task
 ```
 
 Forward preservation data at `theta_tilde`, then restore `theta`. For generated
@@ -251,12 +253,12 @@ verl/verl/experimental/grit/preservation.py
 verl/verl/workers/actor/dp_actor.py
 ```
 
-### Phase 4: Optional Curvature HVP
+### Phase 4: Optional Curvature
 
 Full proposal correction:
 
 ```text
-g_final = P g_task - lambda_pres * (v + alpha * H_task P v)
+preservation_correction = v - lr * H_task P v
 ```
 
 where:
@@ -268,7 +270,16 @@ u = P v
 ```
 
 Do not build a full Hessian. Use HVP only when `--use-curvature` is enabled.
-On T4, expect this path to be much heavier than first-order GRIT.
+Curvature backends:
+
+```text
+exact_hvp   autograd Hessian-vector product
+sam_fd      SAM-style finite difference:
+            H_task u ~= (grad_task(theta + rho * u / ||u||) - grad_task(theta)) * ||u|| / rho
+```
+
+On T4, exact HVP is much heavier than first-order GRIT. `sam_fd` avoids
+second-order autograd but costs one extra task-loss forward/backward.
 
 Main files:
 
@@ -279,21 +290,30 @@ test_function/check_hvp.py
 test_function/check_grpo_curvature_update.py
 ```
 
-### Phase 5: Final Optimizer Gradient
+### Phase 5: One-LR Update
 
 First-order default:
 
 ```text
-g_final = P g_task - lambda_pres * v
+direction_task = AdamW_direction(grad_task)
+term_task = project(direction_task)
+W <- W + lr * (term_task - lambda_pres * v)
+```
+
+With curvature:
+
+```text
+preservation_correction = v - lr * H_task P v
+W <- W + lr * (term_task - lambda_pres * preservation_correction)
 ```
 
 Curvature ablation:
 
 ```text
-g_final = P g_task - lambda_pres * (v + alpha * H_task P v)
+update_direction = term_task - lambda_pres * (v - lr * H_task P v)
 ```
 
-The optimizer must see `g_final`, not the raw task gradient.
+`lr` is multiplied once, after the task and preservation directions are combined.
 
 Main files:
 
@@ -358,7 +378,6 @@ bash scripts/run_kaggle_grit_train.sh \
   --model-revision <base_revision-from-generation-manifest> \
   --max-preserve-length 2304 \
   --lr 5e-7 \
-  --alpha 1e-3 \
   --lambda-pres 0.1 \
   --epsilon-pres 1e-3
 ```
@@ -374,6 +393,12 @@ Enable Phase 4 only as an explicit ablation:
 
 ```bash
 bash scripts/run_kaggle_grit_train.sh --use-curvature
+```
+
+Use SAM finite-difference curvature to avoid exact second-order HVP:
+
+```bash
+CURVATURE_MODE=sam_fd SAM_RHO=0.05 bash scripts/run_kaggle_grit_train.sh --use-curvature
 ```
 
 Use very small settings for Phase 4 smoke on T4:
@@ -394,8 +419,9 @@ task                current batch task loss
 pres                current batch preservation loss
 kl                  current batch preservation violation fraction
 grad                current final gradient norm
-hvp                 HVP norm, zero when curvature is disabled
+hvp                 exact or SAM-FD HVP approximation norm, zero when curvature is disabled
 hvp_skip            1 when HVP is skipped
+curv                curvature backend shown in tqdm: hvp or sam
 ```
 
 Run-average metrics:

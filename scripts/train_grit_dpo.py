@@ -30,7 +30,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from grit.optimizer_delta import AdamWDeltaPreconditioner, apply_split_adamw_delta_update
+from grit.optimizer_delta import (
+    AdamWDirectionPreconditioner,
+    adamw_task_directions,
+    apply_grit_update,
+)
 from grit.preservation_loss import preservation_kl_loss
 from grit.update import GritUpdateConfig, assemble_grit_update
 
@@ -98,7 +102,6 @@ def parse_args() -> argparse.Namespace:
         help="AdamW epsilon. Keep this >=1e-4 for fp16 training to avoid optimizer NaNs.",
     )
     parser.add_argument("--dpo-beta", type=float, default=0.1)
-    parser.add_argument("--alpha", type=float, default=1e-2)
     parser.add_argument("--lambda-pres", type=float, default=1.0)
     parser.add_argument("--epsilon-pres", type=float, default=1e-4)
     parser.add_argument("--top-k", type=int, default=64)
@@ -106,6 +109,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--module-pattern", default="mlp")
     parser.add_argument("--missing-projector", choices=["identity", "zero"], default="identity")
     parser.add_argument("--use-curvature", action="store_true")
+    parser.add_argument(
+        "--curvature-mode",
+        choices=["exact_hvp", "sam_fd"],
+        default="exact_hvp",
+        help="Phase 4 curvature backend: exact autograd HVP or SAM-style finite difference.",
+    )
+    parser.add_argument(
+        "--sam-rho",
+        type=float,
+        default=0.05,
+        help="SAM finite-difference perturbation radius for --curvature-mode sam_fd.",
+    )
+    parser.add_argument(
+        "--sam-no-normalize-direction",
+        action="store_true",
+        help="Use rho * P v directly for SAM-FD instead of rho * P v / ||P v||.",
+    )
     parser.add_argument(
         "--hvp-last-linear-layers",
         type=int,
@@ -609,6 +629,8 @@ AGGREGATED_METRIC_KEYS = (
     "proj_grad",
     "hvp_norm",
     "hvp_parameter_count",
+    "curvature_mode_sam_fd",
+    "sam_rho",
     "corrected_preservation_grad_norm",
     "reward_mean",
     "unsafe_fraction",
@@ -619,12 +641,12 @@ AGGREGATED_METRIC_KEYS = (
     "ratio_clip_fraction",
     "gpu_mem_peak_alloc_gb",
     "gpu_mem_peak_reserved_gb",
-    "split_adamw_task_delta_norm",
-    "split_adamw_task_projected_delta_norm",
-    "split_adamw_task_removed_delta_norm",
-    "split_adamw_task_removed_fraction",
-    "split_adamw_preservation_delta_norm",
-    "split_adamw_final_delta_norm",
+    "adamw_task_direction_norm",
+    "adamw_task_projected_direction_norm",
+    "adamw_task_removed_direction_norm",
+    "adamw_task_removed_fraction",
+    "raw_preservation_direction_norm",
+    "grit_final_delta_norm",
 )
 
 
@@ -674,12 +696,13 @@ def parameters_are_finite(model: torch.nn.Module) -> bool:
 
 
 def configure_attention_for_curvature(args: argparse.Namespace) -> str | None:
+    exact_hvp = args.use_curvature and args.curvature_mode == "exact_hvp"
     if args.attn_implementation == "auto":
-        attn_implementation = "eager" if args.use_curvature else None
+        attn_implementation = "eager" if exact_hvp else None
     else:
         attn_implementation = args.attn_implementation
 
-    if args.use_curvature and torch.cuda.is_available():
+    if exact_hvp and torch.cuda.is_available():
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(True)
@@ -806,24 +829,19 @@ def maybe_push_to_hub(args: argparse.Namespace, checkpoint_dir: Path, step: int)
 
 
 def split_delta_state_dict(
-    task_preconditioner: AdamWDeltaPreconditioner | None,
-    preservation_preconditioner: AdamWDeltaPreconditioner | None,
+    task_preconditioner: AdamWDirectionPreconditioner | None,
 ) -> dict[str, Any] | None:
-    if task_preconditioner is None or preservation_preconditioner is None:
+    if task_preconditioner is None:
         return None
-    return {
-        "task": task_preconditioner.state_dict(),
-        "preservation": preservation_preconditioner.state_dict(),
-    }
+    return {"task": task_preconditioner.state_dict()}
 
 
 def load_split_delta_state_if_needed(
-    task_preconditioner: AdamWDeltaPreconditioner | None,
-    preservation_preconditioner: AdamWDeltaPreconditioner | None,
+    task_preconditioner: AdamWDirectionPreconditioner | None,
     checkpoint_path: str | None,
     device: torch.device,
 ) -> None:
-    if task_preconditioner is None or preservation_preconditioner is None or checkpoint_path is None:
+    if task_preconditioner is None or checkpoint_path is None:
         return
     checkpoint_dir = Path(checkpoint_path)
     if checkpoint_dir.is_file():
@@ -833,7 +851,6 @@ def load_split_delta_state_if_needed(
         return
     state = torch.load(state_path, map_location=device)
     task_preconditioner.load_state_dict(state["task"])
-    preservation_preconditioner.load_state_dict(state["preservation"])
 
 
 def load_checkpoint_if_needed(model, optimizer, checkpoint_path: str | None, device: torch.device) -> int:
@@ -902,7 +919,11 @@ def main() -> None:
     if attn_implementation is not None:
         model_kwargs["attn_implementation"] = attn_implementation
     if main_process and args.use_curvature:
-        print(f"curvature attention implementation: {attn_implementation or 'auto'}", flush=True)
+        print(
+            f"curvature mode: {args.curvature_mode} "
+            f"attention implementation: {attn_implementation or 'auto'}",
+            flush=True,
+        )
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
@@ -951,19 +972,12 @@ def main() -> None:
         eps=args.adam_eps,
     )
     start_step = load_checkpoint_if_needed(model, optimizer, args.resume_from_checkpoint, device)
-    split_task_preconditioner = AdamWDeltaPreconditioner(
-        lr=args.lr,
-        eps=args.adam_eps,
-        weight_decay=args.weight_decay,
-    )
-    split_preservation_preconditioner = AdamWDeltaPreconditioner(
-        lr=args.lr,
+    split_task_preconditioner = AdamWDirectionPreconditioner(
         eps=args.adam_eps,
         weight_decay=args.weight_decay,
     )
     load_split_delta_state_if_needed(
         split_task_preconditioner,
-        split_preservation_preconditioner,
         args.resume_from_checkpoint,
         device,
     )
@@ -1061,7 +1075,6 @@ def main() -> None:
             optimizer=optimizer,
             split_delta_state=split_delta_state_dict(
                 split_task_preconditioner,
-                split_preservation_preconditioner,
             ),
             output_dir=output_dir,
             step=start_step,
@@ -1106,7 +1119,11 @@ def main() -> None:
             )
             chosen_batch = move_batch(chosen_batch, device)
             rejected_batch = move_batch(rejected_batch, device)
-            task_loss = dpo_like_task_loss(model, chosen_batch, rejected_batch, beta=args.dpo_beta)
+
+            def task_loss_fn():
+                return dpo_like_task_loss(model, chosen_batch, rejected_batch, beta=args.dpo_beta)
+
+            task_loss = task_loss_fn()
         else:
             assert safety_model is not None and safety_tokenizer is not None
             prompts = [row["prompt"] for row in task_rows]
@@ -1166,6 +1183,17 @@ def main() -> None:
                 clip_ratio=args.grpo_clip_ratio,
             )
 
+            def task_loss_fn():
+                loss, _metrics = grpo_safety_task_loss(
+                    model,
+                    rollout_batch,
+                    old_log_probs,
+                    rewards,
+                    group_size=args.grpo_generations,
+                    clip_ratio=args.grpo_clip_ratio,
+                )
+                return loss
+
         def preservation_loss_fn():
             policy_logits = model(
                 input_ids=pres_input_ids,
@@ -1186,15 +1214,32 @@ def main() -> None:
                 default_probability=args.default_probability,
             )
 
+        def task_direction_fn(parameters, task_gradients):
+            all_reduce_gradient_map(task_gradients, world_size)
+            return adamw_task_directions(
+                model=model,
+                parameters=parameters,
+                task_gradients=task_gradients,
+                projectors=projectors,
+                task_preconditioner=split_task_preconditioner,
+                module_filter=module_filter,
+                missing_projector=args.missing_projector,
+            )
+
         result = assemble_grit_update(
             model,
             task_loss,
             preservation_loss_fn,
             projectors,
+            task_loss_fn=task_loss_fn,
+            task_direction_fn=task_direction_fn,
             config=GritUpdateConfig(
-                alpha=args.alpha,
+                learning_rate=args.lr,
                 lambda_pres=args.lambda_pres,
                 use_curvature=args.use_curvature,
+                curvature_mode=args.curvature_mode,
+                sam_rho=args.sam_rho,
+                sam_normalize_direction=not args.sam_no_normalize_direction,
                 hvp_last_linear_layers=args.hvp_last_linear_layers,
                 missing_projector=args.missing_projector,
             ),
@@ -1209,23 +1254,23 @@ def main() -> None:
                 "Non-finite GRIT gradients detected before split AdamW-delta update. "
                 "Try --dtype float32, lower --lr, or set --adam-eps 1e-4 for fp16."
             )
-        all_reduce_gradient_map(result.task_gradients, world_size)
         all_reduce_gradient_map(result.preservation_correction, world_size)
         split_parameters = [
             (name, parameter)
             for name, parameter in model.named_parameters()
             if name in result.task_gradients
         ]
-        optimizer_delta_metrics = apply_split_adamw_delta_update(
+        optimizer_delta_metrics = apply_grit_update(
             model=model,
             parameters=split_parameters,
             task_gradients=result.task_gradients,
             preservation_gradients=result.preservation_correction,
             projectors=projectors,
             task_preconditioner=split_task_preconditioner,
-            preservation_preconditioner=split_preservation_preconditioner,
-            alpha=args.alpha,
+            learning_rate=args.lr,
             lambda_pres=args.lambda_pres,
+            task_directions=result.task_directions,
+            projected_task_directions=result.projected_task_directions,
             module_filter=module_filter,
             missing_projector=args.missing_projector,
         )
@@ -1244,6 +1289,8 @@ def main() -> None:
             "proj_grad": result.metrics["grit/projected_task_grad_norm"],
             "hvp_skipped": result.metrics.get("grit/hvp_skipped", 1.0),
             "hvp_parameter_count": result.metrics.get("grit/hvp_parameter_count", 0.0),
+            "curvature_mode_sam_fd": result.metrics.get("grit/curvature_mode_sam_fd", 0.0),
+            "sam_rho": result.metrics.get("grit/sam_rho", 0.0),
             "projected_vector_norm": result.metrics.get("grit/projected_vector_norm", 0.0),
             "hvp_norm": result.metrics.get("grit/hvp_norm", 0.0),
             "corrected_preservation_grad_norm": result.metrics.get(
@@ -1274,6 +1321,7 @@ def main() -> None:
                 hvp=f"{last_metrics['hvp_norm']:.2e}",
                 hvp_n=f"{last_metrics['hvp_parameter_count']:.0f}",
                 hvp_skip=f"{last_metrics['hvp_skipped']:.0f}",
+                curv="sam" if last_metrics.get("curvature_mode_sam_fd", 0.0) else "hvp",
                 reward=f"{last_metrics.get('reward_mean', 0.0):.3f}",
                 reward_avg=f"{last_metrics.get('run_reward_mean', 0.0):.3f}",
                 unsafe=f"{last_metrics.get('unsafe_fraction', 0.0):.2f}",
@@ -1282,7 +1330,7 @@ def main() -> None:
                 adv=f"{last_metrics.get('adv_abs_mean', 0.0):.2f}",
                 ratio=f"{last_metrics.get('ratio_mean', 0.0):.3f}",
                 clip=f"{last_metrics.get('ratio_clip_fraction', 0.0):.2f}",
-                split=f"{last_metrics.get('split_adamw_task_removed_fraction', 0.0):.2f}",
+                split=f"{last_metrics.get('adamw_task_removed_fraction', 0.0):.2f}",
                 peak=f"{last_metrics.get('gpu_mem_peak_alloc_gb', 0.0):.1f}G",
                 peak_r=f"{last_metrics.get('gpu_mem_peak_reserved_gb', 0.0):.1f}G",
             )
@@ -1294,7 +1342,6 @@ def main() -> None:
                 optimizer=optimizer,
                 split_delta_state=split_delta_state_dict(
                     split_task_preconditioner,
-                    split_preservation_preconditioner,
                 ),
                 output_dir=output_dir,
                 step=step,
@@ -1337,7 +1384,6 @@ def main() -> None:
                 optimizer=optimizer,
                 split_delta_state=split_delta_state_dict(
                     split_task_preconditioner,
-                    split_preservation_preconditioner,
                 ),
                 output_dir=output_dir,
                 step=step,
@@ -1381,7 +1427,6 @@ def main() -> None:
                 optimizer=optimizer,
                 split_delta_state=split_delta_state_dict(
                     split_task_preconditioner,
-                    split_preservation_preconditioner,
                 ),
                 output_dir=output_dir,
                 step=args.max_steps,
@@ -1397,7 +1442,6 @@ def main() -> None:
             optimizer=optimizer,
             split_delta_state=split_delta_state_dict(
                 split_task_preconditioner,
-                split_preservation_preconditioner,
             ),
             output_dir=output_dir,
             step=args.max_steps,

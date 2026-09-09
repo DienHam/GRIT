@@ -56,18 +56,18 @@ def _squared_norm(gradients: Mapping[str, torch.Tensor]) -> float:
 def temporary_predictor_step(
     model: nn.Module,
     *,
-    alpha: float,
+    learning_rate: float,
     gradients: GradientMap,
 ) -> Iterator[PredictorStepInfo]:
-    """Temporarily apply ``theta_tilde = theta - alpha * gradients``.
+    """Temporarily apply ``theta_tilde = theta - learning_rate * gradients``.
 
     The ``gradients`` mapping should contain the post-Phase-1 task gradients:
     projected MLP Linear weight gradients and identity/unprojected gradients for
     trainable parameters outside the projector surface.
     """
 
-    if alpha < 0:
-        raise ValueError(f"alpha must be non-negative, got {alpha}")
+    if learning_rate < 0:
+        raise ValueError(f"learning_rate must be non-negative, got {learning_rate}")
 
     deltas: list[tuple[nn.Parameter, torch.Tensor]] = []
     update_sq = 0.0
@@ -85,7 +85,9 @@ def temporary_predictor_step(
                     f"expected {tuple(parameter.shape)}"
                 )
 
-            delta = gradient.detach().to(device=parameter.device, dtype=parameter.dtype).mul(-alpha)
+            delta = gradient.detach().to(device=parameter.device, dtype=parameter.dtype).mul(
+                -learning_rate
+            )
             parameter.add_(delta)
             deltas.append((parameter, delta))
 
@@ -113,7 +115,7 @@ def write_final_grit_gradients(
     *,
     lambda_pres: float,
 ) -> dict[str, float]:
-    """Write ``g_projected - lambda_pres * v_preservation`` to ``.grad``."""
+    """Write ``g_projected + lambda_pres * v_preservation`` to ``.grad``."""
 
     if lambda_pres < 0:
         raise ValueError(f"lambda_pres must be non-negative, got {lambda_pres}")
@@ -130,7 +132,7 @@ def write_final_grit_gradients(
         if preservation is None:
             preservation = torch.zeros_like(projected)
 
-        final = projected.to(device=parameter.device, dtype=parameter.dtype).sub(
+        final = projected.to(device=parameter.device, dtype=parameter.dtype).add(
             preservation.to(device=parameter.device, dtype=parameter.dtype).mul(lambda_pres)
         )
         parameter.grad = final.detach().clone()

@@ -95,7 +95,7 @@ def run_update(
         preservation_loss_fn,
         projectors,
         config=GritUpdateConfig(
-            alpha=0.2,
+            learning_rate=0.2,
             lambda_pres=lambda_pres,
             use_curvature=use_curvature,
         ),
@@ -134,7 +134,7 @@ def main() -> None:
         None,
         projectors,
         config=GritUpdateConfig(
-            alpha=0.2,
+            learning_rate=0.2,
             lambda_pres=0.0,
             use_curvature=False,
         ),
@@ -149,6 +149,48 @@ def main() -> None:
     assert projection_only.metrics["grit/hvp_skipped"] == 1.0
     assert_parameters_restored(model, baseline_parameters)
 
+    expected_predictor_weight = baseline_parameters["mlp.weight"].clone()
+    expected_predictor_bias = baseline_parameters["mlp.bias"].clone()
+    signed_direction = {
+        "mlp.weight": torch.full_like(model.mlp.weight, 0.125),
+        "mlp.bias": torch.full_like(model.mlp.bias, -0.25),
+    }
+
+    def task_direction_fn(parameters, _task_gradients):
+        directions = {name: signed_direction[name].clone() for name, _parameter in parameters}
+        return directions, directions, {"adamw_task_direction_norm": 1.0}
+
+    def checked_preservation_loss_fn():
+        torch.testing.assert_close(
+            model.mlp.weight,
+            expected_predictor_weight + 0.2 * signed_direction["mlp.weight"],
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        torch.testing.assert_close(
+            model.mlp.bias,
+            expected_predictor_bias + 0.2 * signed_direction["mlp.bias"],
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        return model.mlp.weight.square().mean()
+
+    task_loss = 0.5 * (model(task_x) - task_target).square().mean()
+    delta_predictor = assemble_grit_update(
+        model,
+        task_loss,
+        checked_preservation_loss_fn,
+        projectors,
+        task_direction_fn=task_direction_fn,
+        config=GritUpdateConfig(
+            learning_rate=0.2,
+            lambda_pres=0.7,
+            use_curvature=False,
+        ),
+    )
+    assert delta_predictor.metrics["adamw_task_direction_norm"] == 1.0
+    assert_parameters_restored(model, baseline_parameters)
+
     first_order = run_update(
         model,
         base_model,
@@ -158,7 +200,7 @@ def main() -> None:
     )
     manual_first_order = (
         first_order.projected_task_gradients["mlp.weight"]
-        - 0.7 * first_order.preservation_gradients["mlp.weight"]
+        + 0.7 * first_order.preservation_gradients["mlp.weight"]
     )
     torch.testing.assert_close(
         first_order.final_gradients["mlp.weight"],

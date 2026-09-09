@@ -67,7 +67,7 @@ so `Linear.weight.grad` exists for projection.
 Phase 2 implements the temporary predictor point used for preservation checks:
 
 ```text
-theta_tilde = theta - alpha * projected_grad
+theta_tilde = theta + lr * projected_task_direction
 ```
 
 Use `temporary_predictor_step(...)` to forward a preservation batch at
@@ -119,7 +119,7 @@ tensorized `D_preserve` file with `input_ids`, `attention_mask`,
 `position_ids`, `responses`, and `response_mask`, and set `base_model_path`
 for the frozen `pi_base`. The actor computes the PPO/task backward, projects
 the task gradients, temporarily applies
-`theta_tilde = theta - alpha * projected_task_grad`, evaluates
+`theta_tilde = theta + lr * projected_task_direction`, evaluates
 `KL(pi_tilde || pi_base)` through the same trust-region projection loss,
 restores `theta`, and combines the final gradient with
 `lambda_pres * grad_{theta_tilde} L_pres`. It logs:
@@ -142,7 +142,7 @@ Phase 4 implements the optional exact curvature correction from the unrolled
 GRIT objective:
 
 ```text
-v + alpha * H_task(theta) P v
+v - lr * H_task(theta) P v
 ```
 
 where `v = grad_{theta_tilde} L_pres(theta_tilde)` and `P` is a full-theta
@@ -170,12 +170,12 @@ final_grad = projected_task_grad - lambda_pres * v
 with the optional curvature form:
 
 ```text
-final_grad = projected_task_grad - lambda_pres * (v + alpha * H P v)
+update_direction = projected_task_direction - lambda_pres * (v - lr * H P v)
 ```
 
 Use `assemble_grit_update(...)` after computing the task minimization loss and
 before `optimizer.step()`. The preservation loss callback is evaluated at
-`theta_tilde = theta - alpha * projected_task_grad`, then the original model
+`theta_tilde = theta + lr * projected_task_direction`, then the original model
 weights are restored and `parameter.grad` is replaced with the final GRIT
 gradient. Set `lambda_pres: 0` for the gradient-projection-only ablation,
 `use_curvature: false` for first-order GRIT, and `use_curvature: true` to add
@@ -262,14 +262,25 @@ Long steps print timestamps and progress bars. During projector building,
 `[3/5] Forward batches` tracks model forward over preservation batches, and
 `[4/5] Eigendecomposition` tracks projector construction per protected layer.
 
-By default the preservation file is sampled from the task dataset prompt
-column, which is enough to validate the GRIT wiring. If you have the NSPO-style
-mixed preservation dataset from common-sense/math/code prompts, pass it as a
-Hugging Face dataset name or local dataset path:
+By default the preservation file uses the three general-task sources cited by
+the NSPO paper: AlpacaFarm instructions, LeetCodeDataset train, and GSM8K train.
+The paper specifies 1,000 mixed prompts but not the mixing ratio, so this repo
+uses a deterministic near-even split (334 common-sense/instruction, 333 code,
+333 math). To use a custom preservation dataset instead, pass a Hugging Face
+dataset name or local path:
 
 ```bash
 PRESERVE_DATASET=/path/to/mixed_preserve_dataset \
 scripts/run_grit_workflow.sh
+```
+
+Rebuild only the default NSPO preservation file without touching task data:
+
+```bash
+/Users/apple/miniconda3/envs/grit-qwen3/bin/python scripts/prepare_grit_data.py \
+  --preserve-only \
+  --preserve-max-samples 1000 \
+  --output-dir data/grit_qwen2_5_0_5b
 ```
 
 Intermediate artifacts:

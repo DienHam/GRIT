@@ -619,15 +619,13 @@ class DataParallelPPOActor(BasePPOActor):
                     lambda_pres = grit_cfg.get("lambda_pres", None)
                     if lambda_pres is None:
                         lambda_pres = grit_cfg.get("update", {}).get("lambda_pres", 1.0)
-                    alpha = grit_cfg.get("alpha", None)
-                    if alpha is None:
-                        alpha = grit_cfg.get("update", {}).get("alpha", 1.0)
+                    learning_rate = self.actor_optimizer.param_groups[0]["lr"]
 
                     pres_cfg = grit_cfg.get("preservation", None)
                     if pres_cfg is not None and pres_cfg.get("enable", False) and lambda_pres > 0:
                         with temporary_predictor_step(
                             self.actor_module,
-                            alpha=alpha,
+                            learning_rate=learning_rate,
                             gradients=projected_task_gradients,
                         ) as predictor_info:
                             mini_batch_metrics.update(predictor_info.metrics())

@@ -89,7 +89,7 @@ def main() -> None:
     optimizer_state_before = copy.deepcopy(optimizer.state_dict())
     projected_grads = clone_current_gradients(model)
 
-    with temporary_predictor_step(model, alpha=0.3, gradients=projected_grads) as info:
+    with temporary_predictor_step(model, learning_rate=0.3, gradients=projected_grads) as info:
         predictor_logits = model(**batch).detach().clone()
         assert info.updated_parameters == len(projected_grads)
         assert info.update_norm > 0.0

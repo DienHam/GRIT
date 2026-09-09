@@ -1,18 +1,25 @@
-# Phase 4 Skill: Curvature HVP
+# Phase 4 Skill: Curvature HVP / SAM-FD
 
 ## Goal
 
-Add optional curvature:
+Add optional curvature, using either exact HVP or SAM-style finite difference:
 
 ```text
-v + alpha * H P v
+v - lr * H P v
 ```
 
 where:
 
 ```text
 v = grad_{theta_tilde} L_pres(theta_tilde)
-H = Hessian_theta J_task(theta)
+H = Hessian_theta L_task(theta)
+```
+
+SAM-FD approximation:
+
+```text
+u = P v
+H u ~= (grad_task(theta + rho * u / ||u||) - grad_task(theta)) * ||u|| / rho
 ```
 
 ## Source To Compare
@@ -34,8 +41,9 @@ Before moving on:
 
 ```text
 manual HVP matches finite difference on a toy model
+SAM-FD approximates exact HVP on a toy model
 curvature path is skipped when v == 0
-create_graph=True is only used where needed
+create_graph=True is only used for exact HVP, not SAM-FD
 ```
 
 ## Debug Notes
@@ -57,4 +65,5 @@ hvp = torch.autograd.grad(dot, params)
 ```
 
 - Do not build the full Hessian matrix.
+- Prefer `curvature_mode=sam_fd` for memory-constrained real-model tests.
 - Watch signs: if code minimizes `task_loss = -J_task`, document whether `H` belongs to `J_task` or `task_loss`.

@@ -16,7 +16,7 @@ Use the phase skill cards in `agent_skills/` when implementing or debugging. Eac
 | 2 | `agent_skills/phase_2_predictor_theta_tilde.md` | Create temporary predictor weights `theta_tilde` and restore `theta`. |
 | 3 | `agent_skills/phase_3_trust_region_preservation.md` | Add TROLL-style token KL projection on `D_pres` anchored to `pi_base`. |
 | 4 | `agent_skills/phase_4_curvature_hvp.md` | Add optional curvature term `H P v` with Hessian-vector products. |
-| 5 | `agent_skills/phase_5_total_update.md` | Assemble split AdamW-delta updates, logging, and configs. |
+| 5 | `agent_skills/phase_5_total_update.md` | Assemble the one-learning-rate update, logging, and configs. |
 
 ## Non-Negotiables
 

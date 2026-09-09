@@ -58,7 +58,7 @@ log_step "Step 3/3: run one GRIT smoke update"
   --projectors-path "${PROJECTORS_PATH}" \
   --task-batch-size 1 \
   --preserve-batch-size 1 \
-  --alpha 1e-5 \
+  --lr 1e-5 \
   --lambda-pres 1.0 \
   --epsilon-pres 0.05 \
   --top-k 64 \

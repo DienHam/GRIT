@@ -2,10 +2,13 @@
 
 ## Goal
 
-Create temporary predictor weights:
+Create temporary predictor weights using the same signed projected task
+direction that the real update will apply:
 
 ```text
-theta_tilde = theta - alpha * projected_grad
+direction_task = AdamW_direction(grad_task)
+term_task = project(direction_task)
+theta_tilde = theta + lr * term_task
 ```
 
 then forward a preservation batch at `theta_tilde`, and restore the original `theta`.
@@ -39,7 +42,7 @@ no optimizer state is stepped during predictor creation
 - Store deltas, not a full model copy, where possible:
 
 ```text
-delta = -alpha * projected_grad
+delta = lr * projected_task_direction
 p.add_(delta)
 p.sub_(delta)
 ```

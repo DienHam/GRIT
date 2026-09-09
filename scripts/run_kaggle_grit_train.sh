@@ -44,6 +44,9 @@ if [[ -z "${EVAL_FILE:-}" ]]; then
 fi
 EVAL_OUTPUT_FILE="${EVAL_OUTPUT_FILE:-}"
 HVP_LAST_LINEAR_LAYERS="${HVP_LAST_LINEAR_LAYERS:-0}"
+CURVATURE_MODE="${CURVATURE_MODE:-exact_hvp}"
+SAM_RHO="${SAM_RHO:-0.05}"
+SAM_NORMALIZE_DIRECTION="${SAM_NORMALIZE_DIRECTION:-1}"
 SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-0}"
 BEST_MIN_DELTA="${BEST_MIN_DELTA:-0.0}"
 VISIBLE_GPU_COUNT="$(python -c 'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)')"
@@ -71,8 +74,9 @@ echo "PROJECTORS_PATH=${PROJECTORS_PATH}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "MAX_STEPS=${MAX_STEPS} SAVE_STEPS=${SAVE_STEPS} METRIC_WINDOW=${METRIC_WINDOW} NPROC_PER_NODE=${NPROC_PER_NODE} VISIBLE_GPU_COUNT=${VISIBLE_GPU_COUNT}"
 echo "EVAL_STEPS=${EVAL_STEPS} EVAL_SAMPLES=${EVAL_SAMPLES} EVAL_GENERATIONS=${EVAL_GENERATIONS} EVAL_FILE=${EVAL_FILE} EVAL_OUTPUT_FILE=${EVAL_OUTPUT_FILE}"
+echo "CURVATURE_MODE=${CURVATURE_MODE} SAM_RHO=${SAM_RHO} SAM_NORMALIZE_DIRECTION=${SAM_NORMALIZE_DIRECTION}"
 echo "SAVE_BEST_CHECKPOINT=${SAVE_BEST_CHECKPOINT} BEST_MIN_DELTA=${BEST_MIN_DELTA}"
-echo "UPDATE_RULE=split_adamw_delta"
+echo "UPDATE_RULE=single_lr_adamw_task_raw_pres"
 echo "TASK_OBJECTIVE=${TASK_OBJECTIVE}"
 if [[ "${TASK_OBJECTIVE}" == "grpo_safety" ]]; then
   echo "SAFETY_MODEL_PATH=${SAFETY_MODEL_PATH}"
@@ -85,6 +89,11 @@ fi
 BEST_CHECKPOINT_ARGS=()
 if [[ "${SAVE_BEST_CHECKPOINT}" == "1" || "${SAVE_BEST_CHECKPOINT}" == "true" ]]; then
   BEST_CHECKPOINT_ARGS=(--save-best-checkpoint --best-min-delta "${BEST_MIN_DELTA}")
+fi
+
+SAM_ARGS=()
+if [[ "${SAM_NORMALIZE_DIRECTION}" == "0" || "${SAM_NORMALIZE_DIRECTION}" == "false" ]]; then
+  SAM_ARGS=(--sam-no-normalize-direction)
 fi
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" scripts/train_grit_dpo.py \
@@ -113,11 +122,13 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" scripts/train_grit_dp
   --max-response-length 128 \
   --max-preserve-length 256 \
   --lr 1e-6 \
-  --alpha 1e-2 \
   --lambda-pres 1.0 \
   --epsilon-pres 1e-4 \
   --top-k 64 \
   --default-probability 1e-6 \
+  --curvature-mode "${CURVATURE_MODE}" \
+  --sam-rho "${SAM_RHO}" \
+  "${SAM_ARGS[@]}" \
   --hvp-last-linear-layers "${HVP_LAST_LINEAR_LAYERS}" \
   --dtype float16 \
   --trust-remote-code \

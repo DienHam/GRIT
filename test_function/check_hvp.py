@@ -84,7 +84,7 @@ def main() -> None:
         loss,
         preservation_grads,
         {"mlp": projector},
-        alpha=0.25,
+        learning_rate=0.25,
         parameters=parameters,
     )
     manual_direction = v.matmul(projector)
@@ -104,13 +104,13 @@ def main() -> None:
     torch.testing.assert_close(result.hvp["mlp.bias"], finite_difference[1], atol=5e-9, rtol=5e-7)
     torch.testing.assert_close(
         result.gradients["mlp.weight"],
-        v + 0.25 * result.hvp["mlp.weight"],
+        v - 0.25 * result.hvp["mlp.weight"],
         atol=1e-12,
         rtol=1e-12,
     )
     torch.testing.assert_close(
         result.gradients["mlp.bias"],
-        bias_v + 0.25 * result.hvp["mlp.bias"],
+        bias_v - 0.25 * result.hvp["mlp.bias"],
         atol=1e-12,
         rtol=1e-12,
     )
@@ -121,7 +121,7 @@ def main() -> None:
         loss,
         {"mlp.weight": torch.zeros_like(v), "mlp.bias": torch.zeros_like(bias_v)},
         {"mlp": projector},
-        alpha=0.25,
+        learning_rate=0.25,
         parameters=parameters,
     )
     assert zero_result.skipped_hvp

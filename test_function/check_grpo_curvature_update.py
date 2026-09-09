@@ -85,6 +85,17 @@ def main() -> None:
         clip_ratio=0.2,
     )
 
+    def task_loss_fn():
+        loss, _metrics = grpo_safety_task_loss(
+            model,
+            rollout_batch,
+            old_log_probs,
+            rewards,
+            group_size=2,
+            clip_ratio=0.2,
+        )
+        return loss
+
     pres_input_ids = torch.tensor([[1, 2, 3, 4], [1, 5, 6, 2]])
     pres_attention_mask = torch.ones_like(pres_input_ids)
     selected_ids = pres_input_ids[:, 1:].contiguous()
@@ -117,8 +128,9 @@ def main() -> None:
         task_loss,
         preservation_loss_fn,
         {"mlp": projector, "lm_head": projector},
+        task_loss_fn=task_loss_fn,
         config=GritUpdateConfig(
-            alpha=0.1,
+            learning_rate=0.1,
             lambda_pres=0.5,
             use_curvature=True,
             hvp_last_linear_layers=1,
@@ -162,6 +174,32 @@ def main() -> None:
         "corrected_preservation_grad_norm="
         f"{result.metrics['grit/corrected_preservation_grad_norm']:.8f}"
     )
+
+    sam_task_loss = task_loss_fn()
+    sam_result = assemble_grit_update(
+        model,
+        sam_task_loss,
+        preservation_loss_fn,
+        {"mlp": projector, "lm_head": projector},
+        task_loss_fn=task_loss_fn,
+        config=GritUpdateConfig(
+            learning_rate=0.1,
+            lambda_pres=0.5,
+            use_curvature=True,
+            curvature_mode="sam_fd",
+            sam_rho=1e-3,
+            hvp_last_linear_layers=1,
+            missing_projector="identity",
+        ),
+        module_filter=all_linear,
+    )
+    assert sam_result.curvature is not None
+    assert not sam_result.curvature.skipped_hvp
+    assert sam_result.metrics["grit/curvature_mode_sam_fd"] == 1.0
+    assert sam_result.metrics["grit/hvp_norm"] > 0.0
+    assert_parameters_restored(model, baseline_parameters)
+    print("sam_fd_curvature_update=True")
+    print(f"sam_hvp_norm={sam_result.metrics['grit/hvp_norm']:.8f}")
 
 
 if __name__ == "__main__":

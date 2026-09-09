@@ -2,11 +2,11 @@
 
 This module writes the optimizer-facing gradient:
 
-    final_grad = projected_task_grad - lambda_pres * v
+    final_grad = projected_task_grad + lambda_pres * v
 
 or, with curvature enabled:
 
-    final_grad = projected_task_grad - lambda_pres * (v + alpha * H P v)
+    final_grad = projected_task_grad + lambda_pres * (v - lr * H P v)
 """
 
 from __future__ import annotations
@@ -22,7 +22,8 @@ from grit.curvature import (
     project_vector_with_module_projectors,
     trainable_named_parameters,
 )
-from grit.predictor import PredictorStepInfo, temporary_predictor_step
+from grit.predictor import PredictorStepInfo, temporary_predictor_direction_step
+from grit.predictor import temporary_predictor_step
 from grit.projection import ProjectorBuildResult, default_module_filter
 from grit.preservation_loss import PreservationLossResult
 
@@ -32,15 +33,22 @@ ParameterFilter = Callable[[str, nn.Parameter], bool]
 NamedParameter = tuple[str, nn.Parameter]
 GradientMap = Mapping[str, torch.Tensor | None]
 PreservationLossFn = Callable[[], torch.Tensor | PreservationLossResult]
+TaskDirectionFn = Callable[
+    [Sequence[NamedParameter], Mapping[str, torch.Tensor]],
+    tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, float]],
+]
 
 
 @dataclass(frozen=True)
 class GritUpdateConfig:
     """Configuration for one GRIT optimizer-gradient assembly."""
 
-    alpha: float = 1.0
+    learning_rate: float = 1e-6
     lambda_pres: float = 1.0
     use_curvature: bool = False
+    curvature_mode: str = "exact_hvp"
+    sam_rho: float = 0.05
+    sam_normalize_direction: bool = True
     hvp_last_linear_layers: int = 0
     missing_projector: str = "identity"
     zero_grad_before_write: bool = True
@@ -55,6 +63,8 @@ class GritUpdateResult:
     projected_task_gradients: dict[str, torch.Tensor]
     preservation_gradients: dict[str, torch.Tensor]
     preservation_correction: dict[str, torch.Tensor]
+    task_directions: dict[str, torch.Tensor]
+    projected_task_directions: dict[str, torch.Tensor]
     preservation_loss: torch.Tensor
     predictor: PredictorStepInfo
     curvature: CurvatureCorrectionResult | None
@@ -77,9 +87,12 @@ def _coerce_config(config: GritUpdateConfig | None, **overrides) -> GritUpdateCo
     if config is None:
         config = GritUpdateConfig()
     values = {
-        "alpha": config.alpha,
+        "learning_rate": config.learning_rate,
         "lambda_pres": config.lambda_pres,
         "use_curvature": config.use_curvature,
+        "curvature_mode": config.curvature_mode,
+        "sam_rho": config.sam_rho,
+        "sam_normalize_direction": config.sam_normalize_direction,
         "hvp_last_linear_layers": config.hvp_last_linear_layers,
         "missing_projector": config.missing_projector,
         "zero_grad_before_write": config.zero_grad_before_write,
@@ -239,10 +252,15 @@ def assemble_grit_update(
     preservation_loss_fn: PreservationLossFn | None,
     projectors: Mapping[str, torch.Tensor | ProjectorBuildResult],
     *,
+    task_loss_fn: Callable[[], torch.Tensor] | None = None,
+    task_direction_fn: TaskDirectionFn | None = None,
     config: GritUpdateConfig | None = None,
-    alpha: float | None = None,
+    learning_rate: float | None = None,
     lambda_pres: float | None = None,
     use_curvature: bool | None = None,
+    curvature_mode: str | None = None,
+    sam_rho: float | None = None,
+    sam_normalize_direction: bool | None = None,
     parameters: Sequence[NamedParameter] | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
@@ -254,23 +272,35 @@ def assemble_grit_update(
 
     ``task_loss`` is the scalar minimization loss for the main RL/objective
     batch. When ``lambda_pres > 0``, ``preservation_loss_fn`` is called inside a
-    temporary ``theta_tilde = theta - alpha * projected_task_grad`` context and
+    temporary ``theta_tilde = theta - lr * projected_task_grad`` context and
     should return either a scalar tensor or ``PreservationLossResult``.
     """
 
     resolved = _coerce_config(
         config,
-        alpha=alpha,
+        learning_rate=learning_rate,
         lambda_pres=lambda_pres,
         use_curvature=use_curvature,
+        curvature_mode=curvature_mode,
+        sam_rho=sam_rho,
+        sam_normalize_direction=sam_normalize_direction,
         missing_projector=missing_projector,
         hvp_last_linear_layers=hvp_last_linear_layers,
         zero_grad_before_write=zero_grad_before_write,
     )
-    if resolved.alpha < 0:
-        raise ValueError(f"alpha must be non-negative, got {resolved.alpha}")
+    if resolved.learning_rate < 0:
+        raise ValueError(
+            f"learning_rate must be non-negative, got {resolved.learning_rate}"
+        )
     if resolved.lambda_pres < 0:
         raise ValueError(f"lambda_pres must be non-negative, got {resolved.lambda_pres}")
+    if resolved.curvature_mode not in {"exact_hvp", "sam_fd"}:
+        raise ValueError(
+            "curvature_mode must be 'exact_hvp' or 'sam_fd', "
+            f"got {resolved.curvature_mode!r}"
+        )
+    if resolved.sam_rho <= 0:
+        raise ValueError(f"sam_rho must be positive, got {resolved.sam_rho}")
     if resolved.missing_projector not in {"identity", "zero"}:
         raise ValueError(
             f"missing_projector must be 'identity' or 'zero', got {resolved.missing_projector!r}"
@@ -284,10 +314,11 @@ def assemble_grit_update(
     if parameters is None:
         parameters = trainable_named_parameters(model, parameter_filter)
 
+    exact_hvp = resolved.use_curvature and resolved.curvature_mode == "exact_hvp"
     task_gradients = _autograd_gradient_map(
         task_loss,
         parameters,
-        retain_graph=resolved.use_curvature,
+        retain_graph=exact_hvp,
         create_graph=False,
         detach=True,
     )
@@ -299,6 +330,14 @@ def assemble_grit_update(
         module_filter=module_filter,
         missing=resolved.missing_projector,
     )
+    if task_direction_fn is None:
+        task_directions = {}
+        projected_task_directions = {}
+        task_direction_metrics = {}
+    else:
+        task_directions, projected_task_directions, task_direction_metrics = (
+            task_direction_fn(parameters, task_gradients)
+        )
 
     preservation_metrics: dict[str, float] = {}
     if resolved.lambda_pres == 0.0:
@@ -314,14 +353,25 @@ def assemble_grit_update(
     else:
         if preservation_loss_fn is None:
             raise ValueError("preservation_loss_fn is required when lambda_pres > 0")
-        with temporary_predictor_step(
-            model,
-            alpha=resolved.alpha,
-            gradients=projected_task_gradients,
-            parameter_filter=parameter_filter,
-            module_filter=module_filter,
-            preserve_autograd_graph=resolved.use_curvature,
-        ) as predictor_info:
+        predictor_context = (
+            temporary_predictor_direction_step(
+                model,
+                learning_rate=resolved.learning_rate,
+                directions=projected_task_directions,
+                parameter_filter=parameter_filter,
+                module_filter=module_filter,
+            )
+            if task_direction_fn is not None
+            else temporary_predictor_step(
+                model,
+                learning_rate=resolved.learning_rate,
+                gradients=projected_task_gradients,
+                parameter_filter=parameter_filter,
+                module_filter=module_filter,
+                preserve_autograd_graph=exact_hvp,
+            )
+        )
+        with predictor_context as predictor_info:
             preservation_result = preservation_loss_fn()
             preservation_loss, preservation_metrics = _preservation_loss_and_metrics(preservation_result)
             preservation_gradients = _autograd_gradient_map(
@@ -332,8 +382,6 @@ def assemble_grit_update(
 
     curvature_result: CurvatureCorrectionResult | None = None
     if resolved.use_curvature and resolved.lambda_pres > 0.0:
-        from grit.curvature import curvature_corrected_preservation_gradients
-
         hvp_parameters = _last_projected_linear_weight_parameters(
             model,
             projectors,
@@ -341,17 +389,39 @@ def assemble_grit_update(
             module_filter,
             resolved.hvp_last_linear_layers,
         )
-        curvature_result = curvature_corrected_preservation_gradients(
-            model,
-            task_loss,
-            preservation_gradients,
-            projectors,
-            alpha=resolved.alpha,
-            parameters=parameters,
-            hvp_parameters=hvp_parameters,
-            module_filter=module_filter,
-            missing_projector=resolved.missing_projector,
-        )
+        if resolved.curvature_mode == "exact_hvp":
+            from grit.curvature import curvature_corrected_preservation_gradients
+
+            curvature_result = curvature_corrected_preservation_gradients(
+                model,
+                task_loss,
+                preservation_gradients,
+                projectors,
+                learning_rate=resolved.learning_rate,
+                parameters=parameters,
+                hvp_parameters=hvp_parameters,
+                module_filter=module_filter,
+                missing_projector=resolved.missing_projector,
+            )
+        else:
+            if task_loss_fn is None:
+                raise ValueError("task_loss_fn is required for curvature_mode='sam_fd'")
+            from grit.curvature import finite_difference_curvature_corrected_preservation_gradients
+
+            curvature_result = finite_difference_curvature_corrected_preservation_gradients(
+                model,
+                task_loss_fn,
+                task_gradients,
+                preservation_gradients,
+                projectors,
+                learning_rate=resolved.learning_rate,
+                rho=resolved.sam_rho,
+                normalize_direction=resolved.sam_normalize_direction,
+                parameters=parameters,
+                hvp_parameters=hvp_parameters,
+                module_filter=module_filter,
+                missing_projector=resolved.missing_projector,
+            )
         preservation_correction = curvature_result.gradients
     else:
         hvp_parameters = []
@@ -359,7 +429,7 @@ def assemble_grit_update(
 
     final_gradients = {
         name: projected_task_gradients[name]
-        - preservation_correction[name].to(projected_task_gradients[name]).mul(resolved.lambda_pres)
+        + preservation_correction[name].to(projected_task_gradients[name]).mul(resolved.lambda_pres)
         for name, _parameter in parameters
     }
     _write_gradients(
@@ -370,9 +440,13 @@ def assemble_grit_update(
 
     skipped_hvp = True if curvature_result is None else curvature_result.skipped_hvp
     metrics = {
-        "grit/alpha": float(resolved.alpha),
+        "grit/learning_rate": float(resolved.learning_rate),
         "grit/lambda_pres": float(resolved.lambda_pres),
         "grit/use_curvature": float(resolved.use_curvature),
+        "grit/curvature_mode_exact_hvp": float(resolved.curvature_mode == "exact_hvp"),
+        "grit/curvature_mode_sam_fd": float(resolved.curvature_mode == "sam_fd"),
+        "grit/sam_rho": float(resolved.sam_rho),
+        "grit/sam_normalize_direction": float(resolved.sam_normalize_direction),
         "grit/hvp_last_linear_layers": float(resolved.hvp_last_linear_layers),
         "grit/hvp_parameter_count": float(len(hvp_parameters)),
         "grit/hvp_skipped": float(skipped_hvp),
@@ -393,6 +467,7 @@ def assemble_grit_update(
         "grit/predictor_update_norm": float(predictor_info.update_norm),
         "grit/predictor_max_update_abs": float(predictor_info.max_update_abs),
     }
+    metrics.update(task_direction_metrics)
     metrics.update(_projector_metrics(projectors))
     metrics.update(preservation_metrics)
     if "grit/preservation_loss" not in metrics:
@@ -412,6 +487,8 @@ def assemble_grit_update(
         projected_task_gradients=projected_task_gradients,
         preservation_gradients=preservation_gradients,
         preservation_correction=preservation_correction,
+        task_directions=task_directions,
+        projected_task_directions=projected_task_directions,
         preservation_loss=preservation_loss.detach(),
         predictor=predictor_info,
         curvature=curvature_result,
