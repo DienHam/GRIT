@@ -38,6 +38,7 @@ from grit.update import GritUpdateConfig, assemble_grit_update
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model-revision", default=None, help="Pinned base revision used to generate preservation contexts.")
     parser.add_argument("--task-file", default="data/grit_qwen2_5_0_5b/task_train.parquet")
     parser.add_argument("--preserve-file", default="data/grit_qwen2_5_0_5b/preserve_1000.parquet")
     parser.add_argument("--projectors-path", default="artifacts/qwen2_5_0_5b_projectors.pt")
@@ -527,6 +528,10 @@ def run_fixed_safety_eval(
 
 
 def tokenize_preserve_batch(tokenizer, rows, *, max_length: int):
+    if any("input_ids" in row for row in rows):
+        from scripts.preservation_data import stored_preservation_batch
+
+        return stored_preservation_batch(tokenizer, rows, max_length=max_length)
     texts = [row["text"] for row in rows]
     tokens = tokenizer(
         texts,
@@ -880,6 +885,7 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path,
+        revision=args.model_revision,
         padding_side="right",
         trust_remote_code=args.trust_remote_code,
     )
@@ -891,6 +897,7 @@ def main() -> None:
     model_kwargs = {
         "torch_dtype": dtype,
         "trust_remote_code": args.trust_remote_code,
+        "revision": args.model_revision,
     }
     if attn_implementation is not None:
         model_kwargs["attn_implementation"] = attn_implementation
@@ -974,6 +981,10 @@ def main() -> None:
         print(f"loading data: {args.task_file} / {args.preserve_file}", flush=True)
     task_ds = load_table(args.task_file)
     preserve_ds = load_table(args.preserve_file)
+    if "base_revision" in preserve_ds.column_names:
+        actual_revision = getattr(base_model.config, "_commit_hash", None)
+        if set(preserve_ds["base_revision"]) != {actual_revision}:
+            raise ValueError("Preservation contexts require their recorded base revision; set --model-revision")
     eval_ds = task_ds
     eval_indices: list[int] | None = None
     if args.eval_file:
