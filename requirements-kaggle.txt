@@ -12,3 +12,4 @@ safetensors
 sentencepiece
 huggingface_hub>=0.30.0,<1.0
 packaging>=20.0
+openai>=1.0.0

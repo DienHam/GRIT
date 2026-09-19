@@ -336,3 +336,48 @@ scripts/run_kaggle_grit_train.sh \
   --push-to-hub \
   --hub-repo-id your-username/grit-qwen2-5-0-5b
 ```
+
+## Modal GPU Notebook: NSPO-style Small-Model Run
+
+Install the vLLM-enabled `verl` extra before running the repository entrypoint:
+
+```bash
+python -m pip install -r requirements-kaggle.txt
+python -m pip install -e 'verl[vllm]'
+```
+
+Use the separate Modal notebook artifact from your Downloads folder, select two
+A10/L4 GPUs (or one A100-40/80GB; the runner
+automatically colocates the tiny guard in that case), and attach the `grit-data`
+Volume at `/mnt/grit-data`.
+The notebook follows the original NSPO recipe from `ivanniu/NSPO`—GRPO on
+PKU-SafeRLHF, five rollouts per prompt, `safe=0`/`unsafe=-1`, and MLP
+activation null-space projectors—while using the small-model path already
+implemented here (`Qwen2.5-0.5B-Instruct` plus `Qwen3Guard-Gen-0.6B`).
+The default backend is `verl_vllm`: GPU 0 runs the FSDP actor plus vLLM
+rollout, while GPU 1 serves the small guard through an OpenAI-compatible vLLM
+endpoint. Set `TRAIN_BACKEND="standalone_hf"` when only one GPU is available.
+
+`METHOD="nspo"` is the projection-only baseline (`lambda_pres=0`). The vLLM
+runner intentionally stays on this path; predictor/preservation/HVP ablations
+remain in the standalone Transformers trainer. Run `RUN_MODE="smoke"` first,
+then switch to `RUN_MODE="full"` for the 1,000-context, 11K-task run.
+
+The reusable repository entrypoint for the projection-only vLLM path is
+`scripts/run_grit_vllm.sh`. GPU 0 runs the FSDP actor plus vLLM rollout and GPU 1
+runs the Qwen3Guard vLLM reward server. Set `OUTPUT_DIR` and the dataset/projector
+paths to directories on the attached Modal Volume:
+
+```bash
+MODEL_PATH=Qwen/Qwen2.5-0.5B-Instruct \
+SAFETY_MODEL_PATH=Qwen/Qwen3Guard-Gen-0.6B \
+TASK_FILE=/mnt/grit-data/grit/data/task_train.parquet \
+VAL_FILE=/mnt/grit-data/grit/data/task_val.parquet \
+PROJECTORS_PATH=/mnt/grit-data/grit/artifacts/projectors.pt \
+OUTPUT_DIR=/mnt/grit-data/grit/checkpoints/grit_vllm \
+MAX_STEPS=32 \
+bash scripts/run_grit_vllm.sh
+```
+
+This path uses vLLM for rollout and safety scoring, while the actor backward,
+GRIT MLP gradient projection, and optimizer update remain in PyTorch/FSDP.

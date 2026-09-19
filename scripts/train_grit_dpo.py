@@ -103,6 +103,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dpo-beta", type=float, default=0.1)
     parser.add_argument("--lambda-pres", type=float, default=1.0)
+    parser.add_argument(
+        "--projection-only",
+        action="store_true",
+        help="Run only the task gradient -> AdamW direction -> projector update; skip preservation runtime, predictor, and curvature.",
+    )
     parser.add_argument("--epsilon-pres", type=float, default=1e-4)
     parser.add_argument("--top-k", type=int, default=64)
     parser.add_argument("--default-probability", type=float, default=1e-6)
@@ -871,6 +876,10 @@ def load_checkpoint_if_needed(model, optimizer, checkpoint_path: str | None, dev
 
 def main() -> None:
     args = parse_args()
+    if args.projection_only and args.lambda_pres != 0.0:
+        raise ValueError("--projection-only requires --lambda-pres 0")
+    if args.projection_only and args.use_curvature:
+        raise ValueError("--projection-only cannot be combined with --use-curvature")
     rank, world_size, local_rank = init_distributed()
     main_process = is_main_process(rank)
 
@@ -951,14 +960,16 @@ def main() -> None:
         for parameter in safety_model.parameters():
             parameter.requires_grad_(False)
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        **model_kwargs,
-    ).to(device)
-    base_model.eval()
-    base_model.config.use_cache = False
-    for parameter in base_model.parameters():
-        parameter.requires_grad_(False)
+    base_model = None
+    if not args.projection_only:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            **model_kwargs,
+        ).to(device)
+        base_model.eval()
+        base_model.config.use_cache = False
+        for parameter in base_model.parameters():
+            parameter.requires_grad_(False)
 
     optimizer = AdamW(
         model.parameters(),
@@ -987,10 +998,11 @@ def main() -> None:
     )
 
     if main_process:
-        print(f"loading data: {args.task_file} / {args.preserve_file}", flush=True)
+        data_message = args.task_file if args.projection_only else f"{args.task_file} / {args.preserve_file}"
+        print(f"loading data: {data_message}", flush=True)
     task_ds = load_table(args.task_file)
-    preserve_ds = load_table(args.preserve_file)
-    if "base_revision" in preserve_ds.column_names:
+    preserve_ds = None if args.projection_only else load_table(args.preserve_file)
+    if preserve_ds is not None and "base_revision" in preserve_ds.column_names:
         actual_revision = getattr(base_model.config, "_commit_hash", None)
         if set(preserve_ds["base_revision"]) != {actual_revision}:
             raise ValueError("Preservation contexts require their recorded base revision; set --model-revision")
@@ -1002,12 +1014,14 @@ def main() -> None:
         eval_ds = load_table(args.eval_file)
         eval_indices = shard_indices(len(eval_ds), rank, world_size, args.seed + 2)
     task_indices = shard_indices(len(task_ds), rank, world_size, args.seed)
-    preserve_indices = shard_indices(len(preserve_ds), rank, world_size, args.seed + 1)
-    if not task_indices or not preserve_indices:
+    preserve_indices = (
+        None if preserve_ds is None else shard_indices(len(preserve_ds), rank, world_size, args.seed + 1)
+    )
+    if not task_indices or (preserve_indices is not None and not preserve_indices):
         raise ValueError("Dataset shard is empty. Use fewer workers or more data.")
 
     task_pos = start_step * args.task_batch_size
-    preserve_pos = start_step * args.preserve_batch_size
+    preserve_pos = None if preserve_indices is None else start_step * args.preserve_batch_size
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     fixed_eval_rows: list[dict[str, Any]] = []
@@ -1086,23 +1100,24 @@ def main() -> None:
 
     for step in progress:
         task_rows, task_pos = take_rows(task_ds, task_indices, task_pos, args.task_batch_size)
-        preserve_rows, preserve_pos = take_rows(
-            preserve_ds,
-            preserve_indices,
-            preserve_pos,
-            args.preserve_batch_size,
-        )
 
         grpo_metrics: dict[str, float] = {}
-        pres_input_ids, pres_attention_mask, selected_ids, response_mask = tokenize_preserve_batch(
-            tokenizer,
-            preserve_rows,
-            max_length=args.max_preserve_length,
-        )
-        pres_input_ids = pres_input_ids.to(device)
-        pres_attention_mask = pres_attention_mask.to(device)
-        selected_ids = selected_ids.to(device)
-        response_mask = response_mask.to(device)
+        if not args.projection_only:
+            preserve_rows, preserve_pos = take_rows(
+                preserve_ds,
+                preserve_indices,
+                preserve_pos,
+                args.preserve_batch_size,
+            )
+            pres_input_ids, pres_attention_mask, selected_ids, response_mask = tokenize_preserve_batch(
+                tokenizer,
+                preserve_rows,
+                max_length=args.max_preserve_length,
+            )
+            pres_input_ids = pres_input_ids.to(device)
+            pres_attention_mask = pres_attention_mask.to(device)
+            selected_ids = selected_ids.to(device)
+            response_mask = response_mask.to(device)
 
         optimizer.zero_grad(set_to_none=True)
         if args.task_objective == "dpo_pair":
