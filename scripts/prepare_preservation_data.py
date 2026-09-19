@@ -15,7 +15,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.preservation_data import sample_source, tokenizer_fingerprint
+try:
+    from scripts.preservation_data import sample_source, tokenizer_fingerprint
+except ModuleNotFoundError as exc:
+    # When this file is invoked as `python scripts/prepare_preservation_data.py`,
+    # Python puts `scripts/` (not the repository root) first on sys.path.
+    # Fall back to the sibling module while preserving unrelated import errors.
+    if exc.name != "scripts.preservation_data":
+        raise
+    from preservation_data import sample_source, tokenizer_fingerprint
 
 
 def file_hash(path: Path) -> str:
