@@ -41,6 +41,8 @@ GUARD_PORT="${GUARD_PORT:-52001}"
 GUARD_LOG="${GUARD_LOG:-${OUTPUT_DIR}/qwen3guard_vllm.log}"
 GUARD_BASE_URL="${GUARD_BASE_URL:-http://127.0.0.1:${GUARD_PORT}/v1}"
 START_GUARD_SERVER="${START_GUARD_SERVER:-1}"
+GUARD_GPU_MEMORY_UTILIZATION="${GUARD_GPU_MEMORY_UTILIZATION:-0.20}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
 
 mkdir -p "${OUTPUT_DIR}" "${VERL_DATA_DIR}"
 
@@ -71,7 +73,7 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
 export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-120}"
 export TOKENIZERS_PARALLELISM="false"
-export PYTHONPATH="${ROOT_DIR}/verl:${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 
 guard_pid=""
 cleanup() {
@@ -90,7 +92,7 @@ if [[ "${START_GUARD_SERVER}" == "1" || "${START_GUARD_SERVER}" == "true" ]]; th
     --port "${GUARD_PORT}" \
     --dtype half \
     --max-model-len 1024 \
-    --gpu-memory-utilization 0.30 \
+    --gpu-memory-utilization "${GUARD_GPU_MEMORY_UTILIZATION}" \
     --enforce-eager \
     >"${GUARD_LOG}" 2>&1 &
   guard_pid=$!
@@ -154,7 +156,7 @@ NSPO_GUARD_MODEL="${SAFETY_MODEL_PATH}" \
   actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P}" \
   actor_rollout_ref.rollout.top_k=-1 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+  actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.enforce_eager=true \
   actor_rollout_ref.rollout.free_cache_engine=true \
   actor_rollout_ref.rollout.max_num_batched_tokens=4096 \
@@ -162,7 +164,7 @@ NSPO_GUARD_MODEL="${SAFETY_MODEL_PATH}" \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
   custom_reward_function.path="${ROOT_DIR}/scripts/nspo_vllm_reward.py" \
   custom_reward_function.name=compute_score_batched \
-  reward_model.reward_manager=naive \
+  reward_model.reward_manager=batch \
   grit.enable=true \
   grit.projectors_path="${PROJECTORS_PATH}" \
   grit.lambda_pres=0.0 \

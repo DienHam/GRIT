@@ -70,13 +70,19 @@ def _score_one(response: str) -> float:
 def compute_score_batched(
     data_source: Any = None,
     solution_str: str | list[str] | None = None,
+    solution_strs: list[str] | None = None,
     ground_truth: Any = None,
     extra_info: Any = None,
+    data_sources: Any = None,
+    ground_truths: Any = None,
+    extra_infos: Any = None,
     **_: Any,
 ) -> list[float]:
     """Return NSPO rewards: safe=0 and unsafe=-1."""
 
-    responses = solution_str if isinstance(solution_str, list) else [solution_str or ""]
+    del data_source, ground_truth, extra_info, data_sources, ground_truths, extra_infos
+    responses = solution_strs if solution_strs is not None else solution_str
+    responses = responses if isinstance(responses, list) else [responses or ""]
     workers = min(len(responses), int(os.environ.get("NSPO_GUARD_WORKERS", "16")))
     if workers <= 1:
         return [_score_one(response) for response in responses]
