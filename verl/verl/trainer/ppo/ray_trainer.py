@@ -1045,6 +1045,11 @@ class RayPPOTrainer:
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
+                            valid = response_masks.bool()
+                            ratio = (batch.batch["old_log_probs"] - batch.batch["rollout_log_probs"])[valid].float().exp()
+                            if ratio.numel() == 0 or not torch.isfinite(ratio).all():
+                                raise ValueError("Invalid rollout/PyTorch log-prob comparison")
+                            metrics["grit/pre_update_ratio_max_abs_error"] = float((ratio - 1).abs().max())
                             # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
@@ -1074,6 +1079,9 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            for key, values in reward_extra_infos_dict.items():
+                                if key.startswith("guard/"):
+                                    metrics[key] = float(np.mean(values))
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

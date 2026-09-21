@@ -324,6 +324,53 @@ config/method/grit.yaml
 
 ## Training Entrypoints
 
+### Projection-only verl / Kaggle T4 x 2
+
+`scripts/run_grit_vllm.sh` runs one FSDP1 actor plus vLLM rollout on GPU 0 and
+Qwen3Guard on GPU 1. Its zero-preservation branch uses `ProjectedAdamW` in
+`verl/verl/experimental/grit/optimizer.py`: update moments from unprojected,
+unscaled/clipped task gradients, form the signed AdamW direction (including any
+decay), right-project protected weights, and apply the learning rate once.
+The legacy preservation-enabled actor branch remains separate.
+
+This backend requires FP32 master parameters, `use_orig_params=true`, and one
+actor GPU; it rejects multi-rank/flattened projection instead of applying a
+local-shard projector. FP16 autocast + GradScaler supports T4. Zero-advantage
+batches skip optimizer/moment updates. Nonfinite gradients skip the update;
+the policy-version counter and LR scheduler advance only on accepted updates.
+Optimizer moments/version use the normal verl optimizer checkpoint; GradScaler
+state is saved with RNG/scheduler in the extra checkpoint and restored on resume.
+
+The data adapter retains `extra_info.raw_prompt` and the batch reward schema.
+Qwen3Guard receives the original prompt plus current rollout response through
+its official tokenizer template; Safe=0, Unsafe/Controversial=-1. Missing or
+ambiguous Safety/Refusal labels retry a bounded number of times and then fail.
+Reward metrics include parse errors, request errors, refusal rate and latency.
+Policy rollout log-probs are retained for a pre-update comparison against the
+PyTorch actor. The PPO denominator stays frozen for the rollout batch.
+
+The runner accepts Hydra overrides at the end, including resume settings:
+
+```bash
+ACTOR_GPU=0 GUARD_GPU=1 MAX_STEPS=3 SAVE_STEPS=1 \
+bash scripts/run_grit_vllm.sh \
+  trainer.resume_mode=resume_path \
+  trainer.resume_from_path=/path/to/global_step_2
+```
+
+Use prepared bundle paths for `TASK_FILE`, `VAL_FILE` and `PROJECTORS_PATH`.
+Do not pass preservation contexts as a runtime preservation dataset. The
+training notebook validates bundle identity, runs smoke/resume, reloads the
+final model and can upload it to the user-configured Hub destination.
+After committing and pushing these files, set the notebook `REPO_REF` to that
+new commit SHA. CPU regression checks do not establish GPU/vLLM compatibility;
+Kaggle install, memory, rollout sync and FP16 smoke must still pass.
+
+```bash
+PYTHONPATH=.:verl python -m pytest -q \
+  test_function/test_projection_only_backend.py verl/tests/experimental/grit
+```
+
 Prepare the pinned 1,000-prompt NSPO-domain pool:
 
 ```bash

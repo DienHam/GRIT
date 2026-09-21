@@ -24,7 +24,7 @@ GRPO_GENERATIONS="${GRPO_GENERATIONS:-5}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-256}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-128}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
-ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.98}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 ACTOR_GPU="${ACTOR_GPU:-0}"
 if [[ -n "${GUARD_GPU:-}" ]]; then
   GUARD_GPU="${GUARD_GPU}"
@@ -73,6 +73,8 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
 export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-120}"
 export TOKENIZERS_PARALLELISM="false"
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
 export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 
 guard_pid=""
@@ -91,7 +93,7 @@ if [[ "${START_GUARD_SERVER}" == "1" || "${START_GUARD_SERVER}" == "true" ]]; th
     --host 127.0.0.1 \
     --port "${GUARD_PORT}" \
     --dtype half \
-    --max-model-len 1024 \
+    --max-model-len "${GUARD_MAX_MODEL_LEN:-2048}" \
     --gpu-memory-utilization "${GUARD_GPU_MEMORY_UTILIZATION}" \
     --enforce-eager \
     >"${GUARD_LOG}" 2>&1 &
@@ -141,15 +143,30 @@ NSPO_GUARD_MODEL="${SAFETY_MODEL_PATH}" \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
   actor_rollout_ref.model.trust_remote_code=true \
   actor_rollout_ref.model.enable_gradient_checkpointing=true \
+  +actor_rollout_ref.model.override_config._attn_implementation=sdpa \
+  +actor_rollout_ref.model.override_config.use_cache=false \
+  actor_rollout_ref.model.use_remove_padding=false \
   actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.optim.weight_decay=0.0 \
+  actor_rollout_ref.actor.use_torch_compile=false \
+  actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
   actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
   actor_rollout_ref.actor.use_kl_loss=false \
   actor_rollout_ref.actor.entropy_coeff=0 \
   actor_rollout_ref.actor.fsdp_config.param_offload=false \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
-  actor_rollout_ref.actor.fsdp_config.use_orig_params=true \
+  ++actor_rollout_ref.actor.fsdp_config.use_orig_params=true \
+  ++actor_rollout_ref.actor.fsdp_config.model_dtype=fp32 \
+  ++actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype=fp16 \
+  ++actor_rollout_ref.actor.fsdp_config.mixed_precision.reduce_dtype=fp32 \
+  ++actor_rollout_ref.actor.fsdp_config.mixed_precision.buffer_dtype=fp32 \
+  ++data.seed=66 \
+  ++actor_rollout_ref.actor.fsdp_config.seed=66 \
   actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.dtype=float16 \
+  actor_rollout_ref.rollout.calculate_log_probs=true \
+  ++actor_rollout_ref.rollout.seed=66 \
   actor_rollout_ref.rollout.mode=sync \
   actor_rollout_ref.rollout.n="${GRPO_GENERATIONS}" \
   actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
@@ -183,4 +200,5 @@ NSPO_GUARD_MODEL="${SAFETY_MODEL_PATH}" \
   trainer.logger='[console]' \
   trainer.project_name=grit_vllm \
   trainer.experiment_name=qwen2_5_0_5b_projection_only \
-  trainer.default_local_dir="${OUTPUT_DIR}"
+  trainer.default_local_dir="${OUTPUT_DIR}" \
+  "$@"

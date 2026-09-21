@@ -41,6 +41,7 @@ from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.experimental.grit.projector import attach_projectors_to_mlp_linears, load_projectors
+from verl.experimental.grit.optimizer import ProjectedAdamW
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -280,6 +281,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
 
         torch_dtype = fsdp_config.get("model_dtype", None)
+        if role == "actor":
+            torch.manual_seed(fsdp_config.get("seed", 42))
         if torch_dtype is None:
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
@@ -287,7 +290,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code,
+            attn_implementation=override_model_config.get("_attn_implementation", "flash_attention_2")
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -506,8 +510,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
+            projection_only = (
+                grit_cfg is not None and grit_cfg.get("enable", False)
+                and float(grit_cfg.get("lambda_pres", 1.0)) == 0.0
+                and not grit_cfg.get("preservation", {}).get("enable", False)
+            )
+            if projection_only:
+                if self.world_size != 1 or fsdp_strategy != "fsdp" or not fsdp_config.get("use_orig_params", False):
+                    raise ValueError("ProjectedAdamW currently requires one FSDP1 actor with use_orig_params=true")
+                if torch_dtype != torch.float32 or grit_cfg.get("use_curvature", False):
+                    raise ValueError("Projection-only requires FP32 master weights and curvature disabled")
+                if self.config.actor.use_kl_loss or self.config.actor.entropy_coeff != 0:
+                    raise ValueError("Projection-only requires a pure task objective (no KL or entropy penalty)")
+            optimizer_class = ProjectedAdamW if projection_only else optim.AdamW
+            optimizer_parameters = actor_module_fsdp if projection_only else actor_module_fsdp.parameters()
+            actor_optimizer = optimizer_class(
+                optimizer_parameters,
                 lr=optim_config.lr,
                 betas=optim_config.get("betas", (0.9, 0.999)),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
@@ -765,7 +783,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
+            if sum(metrics.get("grit/optimizer_updates", [1.0])) > 0:
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})

@@ -152,6 +152,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             )
             local_extra_state_path = copy_to_local(remote_extra_state_path)
             extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+            scaler = getattr(self.optimizer, "grad_scaler", None)
+            if scaler is not None and scaler.is_enabled():
+                if "grad_scaler" not in extra_state_dict:
+                    raise ValueError("FP16 projection-only resume requires GradScaler checkpoint state")
+                scaler.load_state_dict(extra_state_dict["grad_scaler"])
             # recover random state
             if "rng" in extra_state_dict:
                 # 'rng' may not exist for backward compatibility
@@ -251,6 +256,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                         "lr_scheduler": lr_scheduler_state_dict,
                         "rng": self.get_rng_state(),
                     }
+                    scaler = getattr(self.optimizer, "grad_scaler", None)
+                    if scaler is not None:
+                        extra_state_dict["grad_scaler"] = scaler.state_dict()
                     torch.save(extra_state_dict, extra_path)
                     log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
 

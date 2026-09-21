@@ -43,7 +43,8 @@ def main() -> None:
             {
                 "prompt": [{"role": "user", "content": text}],
                 "data_source": "PKU-SafeRLHF",
-                "extra_info": {"index": index},
+                "reward_model": {"style": "rule", "ground_truth": ""},
+                "extra_info": {"index": index, "raw_prompt": text},
             }
         )
     if not rows:

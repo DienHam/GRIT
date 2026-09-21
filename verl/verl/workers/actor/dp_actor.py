@@ -38,6 +38,7 @@ from verl.experimental.grit.predictor import (
     write_final_grit_gradients,
 )
 from verl.experimental.grit.projector import project_actor_mlp_gradients
+from verl.experimental.grit.optimizer import ProjectedAdamW
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
@@ -100,6 +101,17 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self.projected_adamw = isinstance(actor_optimizer, ProjectedAdamW)
+        mixed = self.config.get("fsdp_config", {}).get("mixed_precision", None) or {}
+        precision = mixed.get("param_dtype", "bf16")
+        self.autocast_dtype = {"fp16": torch.float16, "float16": torch.float16,
+                               "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                               "fp32": torch.float32, "float32": torch.float32}[precision]
+        self.grad_scaler = torch.cuda.amp.GradScaler(
+            enabled=self.projected_adamw and self.device_name == "cuda" and self.autocast_dtype == torch.float16
+        )
+        if self.projected_adamw:
+            actor_optimizer.grad_scaler = self.grad_scaler
         self.grit_preservation_dataset = None
         self.grit_base_module = None
         self._init_grit_preservation_branch()
@@ -148,7 +160,8 @@ class DataParallelPPOActor(BasePPOActor):
                         [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
                     )
 
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device_name, dtype=self.autocast_dtype,
+                            enabled=self.autocast_dtype != torch.float32):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -392,6 +405,8 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        if self.projected_adamw:
+            self.grad_scaler.unscale_(self.actor_optimizer)
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
@@ -404,8 +419,16 @@ class DataParallelPPOActor(BasePPOActor):
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
+            if self.projected_adamw:
+                self.actor_optimizer.last_metrics = {"grit/nonfinite_skipped": 1.0, "grit/optimizer_updates": 0.0}
+                if self.grad_scaler.is_enabled():
+                    self.grad_scaler.update(new_scale=self.grad_scaler.get_scale() * 0.5)
         else:
-            self.actor_optimizer.step()
+            if self.projected_adamw:
+                self.grad_scaler.step(self.actor_optimizer)
+                self.grad_scaler.update()
+            else:
+                self.actor_optimizer.step()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -510,6 +533,17 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                if self.projected_adamw:
+                    valid = mini_batch.batch["response_mask"].bool()
+                    advantages = mini_batch.batch["advantages"][valid]
+                    if not torch.isfinite(advantages).all():
+                        raise ValueError("Nonfinite GRPO advantages")
+                    zero_advantage_batch = not bool(torch.count_nonzero(advantages))
+                    append_to_dict(metrics, {"grit/zero_advantage_batch": float(zero_advantage_batch)})
+                    if zero_advantage_batch:
+                        self.actor_optimizer.zero_grad(set_to_none=True)
+                        append_to_dict(metrics, {"grit/optimizer_updates": 0.0, "grit/nonfinite_skipped": 0.0})
+                        continue
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -547,7 +581,7 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    if on_policy:
+                    if on_policy and not self.projected_adamw:
                         old_log_prob = log_prob.detach()
                     else:
                         old_log_prob = model_inputs["old_log_probs"]
@@ -593,7 +627,7 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss * loss_scale_factor
 
-                    loss.backward()
+                    self.grad_scaler.scale(loss).backward()
                     policy_loss_scale_factors.append(loss_scale_factor)
 
                     micro_batch_metrics.update(
@@ -607,7 +641,7 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grit_cfg = self.config.get("grit", None)
-                if grit_cfg is not None and grit_cfg.get("enable", False):
+                if grit_cfg is not None and grit_cfg.get("enable", False) and not self.projected_adamw:
                     projection_metrics = project_actor_mlp_gradients(
                         self.actor_module,
                         module_pattern=grit_cfg.get("module_pattern", "mlp"),
@@ -667,6 +701,8 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, mini_batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                if self.projected_adamw:
+                    append_to_dict(metrics, self.actor_optimizer.last_metrics)
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
