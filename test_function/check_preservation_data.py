@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.preservation_data import (
-    prompt_key, sample_source, source_prompt, stored_context_arrays, tokenizer_fingerprint,
+    preservation_prompt_ids, prompt_key, sample_source, source_prompt, stored_context_arrays, tokenizer_fingerprint,
 )
 
 
@@ -22,6 +22,17 @@ class ToyTokenizer:
 
 
 class PreservationDataTests(unittest.TestCase):
+    def test_chat_encoding_extracts_integer_ids(self):
+        from collections import UserDict
+        from unittest.mock import Mock
+        tokenizer = Mock()
+        tokenizer.apply_chat_template.return_value = UserDict({"input_ids": [1, 2, 3]})
+        self.assertEqual(preservation_prompt_ids(tokenizer, "hello"), [1, 2, 3])
+        tokenizer.apply_chat_template.assert_called_once_with(
+            [{"role": "user", "content": "hello"}],
+            tokenize=True, add_generation_prompt=True, return_dict=True,
+        )
+
     def test_source_formatting_excludes_answers(self):
         self.assertEqual(source_prompt({"instruction": "Explain", "input": "gravity", "output": "secret"}, "general"), "Explain\n\ngravity")
         self.assertEqual(source_prompt({"question": "2+2?", "answer": "4"}, "math"), "2+2?")

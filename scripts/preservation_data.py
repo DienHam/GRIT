@@ -64,6 +64,15 @@ def tokenizer_fingerprint(tokenizer) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def preservation_prompt_ids(tokenizer, prompt: str) -> list[int]:
+    """Request an explicit encoding schema across Transformers 4/5."""
+    encoded = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True, add_generation_prompt=True, return_dict=True,
+    )
+    return list(encoded["input_ids"])
+
+
 def stored_context_arrays(tokenizer, rows, *, max_length: int):
     """Pad exact contexts on the right; retain the original response boundary."""
     fingerprint = getattr(tokenizer, "_grit_preservation_fingerprint", None)

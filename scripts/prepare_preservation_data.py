@@ -16,14 +16,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from scripts.preservation_data import sample_source, tokenizer_fingerprint
+    from scripts.preservation_data import preservation_prompt_ids, sample_source, tokenizer_fingerprint
 except ModuleNotFoundError as exc:
     # When this file is invoked as `python scripts/prepare_preservation_data.py`,
     # Python puts `scripts/` (not the repository root) first on sys.path.
     # Fall back to the sibling module while preserving unrelated import errors.
     if exc.name != "scripts.preservation_data":
         raise
-    from preservation_data import sample_source, tokenizer_fingerprint
+    from preservation_data import preservation_prompt_ids, sample_source, tokenizer_fingerprint
 
 
 def file_hash(path: Path) -> str:
@@ -117,15 +117,12 @@ def generate(args) -> None:
     generated = []
     with (output / "contexts.partial.jsonl").open("w", encoding="utf-8") as stream:
         for index, row in enumerate(rows):
-            prompt_ids = tokenizer.apply_chat_template(
-                [{"role": "user", "content": row["prompt"]}],
-                tokenize=True, add_generation_prompt=True,
-            )
+            prompt_ids = preservation_prompt_ids(tokenizer, row["prompt"])
             # Do not truncate the problem or the chat template silently.
             if len(prompt_ids) > args.max_prompt_length:
                 raise ValueError(f"{row['id']}: prompt exceeds --max-prompt-length")
             set_seed(args.seed + index)
-            inputs = torch.tensor([prompt_ids], device=device)
+            inputs = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             with torch.inference_mode():
                 sequence = model.generate(
                     input_ids=inputs, attention_mask=torch.ones_like(inputs),
