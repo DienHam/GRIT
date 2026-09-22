@@ -224,6 +224,10 @@ wandb/
 *.ckpt
 *.parquet
 
+# The verl Hydra data-config directory is source code, not generated dataset data.
+!verl/verl/trainer/config/data/
+!verl/verl/trainer/config/data/*.yaml
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
